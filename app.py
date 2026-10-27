@@ -31,6 +31,10 @@ from core.mesh_checks import validate_mesh
 from core.fem import (
     MaterialProperties, BoundaryConditions, solve_fem, FEMResult
 )
+from core.cohesive import (
+    ITZProperties, CohesiveMesh, CohesiveState, build_cohesive_mesh,
+    solve_cohesive_fem, NonlinearFEMResult
+)
 
 st.set_page_config(page_title="Mesoscale Concrete Model", layout="wide")
 
@@ -725,6 +729,252 @@ def render_fem_page():
             st.pyplot(fig_def)
 
 # ==============================================================================
+# PAGE 5: COHESIVE ITZ NONLINEAR FEM (PHASE 5)
+# ==============================================================================
+
+def render_cohesive_page():
+    st.title("Phase 5: Cohesive ITZ Modeling & Nonlinear FEM")
+    
+    st.markdown("""
+    Nonlinear Finite Element Method (FEM) solver featuring **4-node zero-thickness cohesive interface elements**
+    inserted along the aggregate-mortar Interfacial Transition Zone (ITZ).
+    
+    **Physical & Numerical Principles:**
+    - **Interface Decoupling:** Node duplication along coarse aggregate perimeters creates displacement jumps $[[\\mathbf{u}]]$ across the interface.
+    - **Bilinear Constitutive Law:** High initial dummy penalty stiffness ($k_n, k_t$), tensile strength criterion ($f_t^{ITZ}$),
+      and linear Mode I softening governed by fracture energy ($G_f^{ITZ}$).
+    - **Contact Formulation:** Penetration in compression ($\delta_n < 0$) is resisted by penalty contact stiffness without inducing opening damage.
+    - **Nonlinear Newton-Raphson Solver:** Incremental displacement-controlled loading with equilibrium iterations,
+      automatic load step cutbacks, and isolated trial state tracking.
+    """)
+
+    if 'current_mesh' not in st.session_state or 'current_if_data' not in st.session_state:
+        st.info("No conforming mesh with interface topology found in current session. Please generate a mesh in **Phase 3: Conforming Mesh** first.")
+        return
+
+    mesh: ConcreteMesh = st.session_state['current_mesh']
+    if_data: InterfaceData = st.session_state['current_if_data']
+
+    if len(if_data.edges) == 0:
+        st.warning("Current mesh contains zero aggregate-mortar interface edges (homogeneous mortar specimen). Cohesive ITZ modeling requires aggregate inclusions.")
+        return
+
+    st.subheader("1. Cohesive Interface Topology Summary")
+    t_col1, t_col2, t_col3, t_col4 = st.columns(4)
+    t_col1.metric("Specimen Size", f"{mesh.domain_width:.1f} × {mesh.domain_height:.1f} mm")
+    t_col2.metric("Original Bulk Nodes", len(mesh.nodes))
+    t_col3.metric("ITZ Interface Segments", len(if_data.edges))
+    t_col4.metric("Aggregate Inclusions", len(set(if_data.aggregate_id)))
+
+    st.subheader("2. Model & Cohesive Parameters")
+    
+    with st.expander("Configure Materials, ITZ Properties & Solver Controls", expanded=True):
+        p_col1, p_col2 = st.columns(2)
+        
+        with p_col1:
+            st.markdown("##### Cohesive ITZ Properties")
+            kn_input = st.number_input("Normal Penalty Stiffness k_n (N/mm³)", value=1.0e5, min_value=1.0e3, max_value=1.0e7, step=1.0e4, format="%.2e")
+            kt_input = st.number_input("Tangential Stiffness k_t (N/mm³)", value=0.5e5, min_value=1.0e3, max_value=1.0e7, step=1.0e4, format="%.2e")
+            ft_input = st.number_input("ITZ Tensile Strength f_t (MPa)", value=2.5, min_value=0.2, max_value=20.0, step=0.1)
+            gf_input = st.number_input("ITZ Mode I Fracture Energy G_f (N/mm)", value=0.05, min_value=0.001, max_value=1.0, step=0.005, format="%.4f")
+            
+            delta_n0 = (ft_input / kn_input) * 1000.0  # micrometers
+            delta_nc = (2.0 * gf_input / ft_input) * 1000.0  # micrometers
+            st.caption(f"**Derived Separations:** Initiation $\\delta_{{n0}} = {delta_n0:.3f}\\ \\mu\\text{{m}}$, Critical $\\delta_{{nc}} = {delta_nc:.2f}\\ \\mu\\text{{m}}$")
+            
+        with p_col2:
+            st.markdown("##### Bulk Material Elastic Moduli")
+            e_agg_c = st.number_input("Aggregate Young's Modulus E_agg (MPa)", value=55000.0, step=1000.0)
+            nu_agg_c = st.number_input("Aggregate Poisson's Ratio ν_agg", value=0.20, step=0.01)
+            e_mor_c = st.number_input("Mortar Young's Modulus E_mor (MPa)", value=25000.0, step=1000.0)
+            nu_mor_c = st.number_input("Mortar Poisson's Ratio ν_mor", value=0.20, step=0.01)
+
+        st.markdown("##### Loading & Numerical Solver Controls")
+        l_col1, l_col2, l_col3, l_col4 = st.columns(4)
+        disp_top_c = l_col1.number_input("Imposed Top Displacement Δy (mm)", value=-0.04, min_value=-1.0, max_value=-0.001, step=0.005, format="%.4f")
+        n_steps_c = l_col2.number_input("Load Increments", value=15, min_value=5, max_value=50, step=5)
+        thickness_c = l_col3.number_input("Specimen Thickness t (mm)", value=1.0, min_value=0.1, max_value=50.0, step=0.5)
+        platen_c = l_col4.selectbox("Platen Friction", ["Frictionless Platens", "Rough / Sticking Platens"])
+        platen_fric_bool = (platen_c != "Frictionless Platens")
+
+    run_nl_btn = st.button("Run Nonlinear Cohesive FEM Analysis", type="primary")
+
+    if run_nl_btn:
+        try:
+            with st.spinner("Building cohesive mesh with duplicated interface nodes..."):
+                coh_mesh = build_cohesive_mesh(mesh, if_data)
+                mat_agg = MaterialProperties(E=float(e_agg_c), nu=float(nu_agg_c), name="Aggregate")
+                mat_mor = MaterialProperties(E=float(e_mor_c), nu=float(nu_mor_c), name="Mortar")
+                itz_props = ITZProperties(k_n=float(kn_input), k_t=float(kt_input), f_t=float(ft_input), G_f=float(gf_input))
+
+            with st.spinner(f"Solving {int(n_steps_c)} nonlinear Newton-Raphson load increments..."):
+                nl_res = solve_cohesive_fem(
+                    coh_mesh=coh_mesh,
+                    mat_mortar=mat_mor,
+                    mat_aggregate=mat_agg,
+                    itz_props=itz_props,
+                    top_displacement=float(disp_top_c),
+                    num_steps=int(n_steps_c),
+                    thickness=float(thickness_c),
+                    platen_friction=platen_fric_bool,
+                    max_iter_per_step=25,
+                    force_tol=1e-2
+                )
+                
+            st.session_state['coh_mesh'] = coh_mesh
+            st.session_state['nl_res'] = nl_res
+            st.session_state['itz_props'] = itz_props
+
+        except Exception as e:
+            st.error(f"Nonlinear Cohesive FEM failed: {str(e)}")
+            return
+
+    if 'nl_res' in st.session_state:
+        coh_mesh: CohesiveMesh = st.session_state['coh_mesh']
+        nl_res: NonlinearFEMResult = st.session_state['nl_res']
+        itz_props: ITZProperties = st.session_state['itz_props']
+
+        st.subheader("3. Macro-Mechanical Nonlinear Response")
+
+        if nl_res.converged:
+            st.success(f"Solver Status: {nl_res.status_message} (Completed in {nl_res.total_time_seconds:.2f} s)")
+        else:
+            st.warning(f"Solver Status: {nl_res.status_message}")
+
+        peak_stress = float(np.max(nl_res.stress_curve)) if len(nl_res.stress_curve) > 0 else 0.0
+        peak_reaction = float(np.max(nl_res.reaction_curve)) if len(nl_res.reaction_curve) > 0 else 0.0
+        final_damage_max = float(np.max(nl_res.final_state.damage))
+        damaged_count = int(np.sum(nl_res.final_state.element_damage > 1e-3))
+
+        c_col1, c_col2, c_col3, c_col4 = st.columns(4)
+        c_col1.metric("Peak Compressive Stress", f"{peak_stress:.2f} MPa")
+        c_col2.metric("Peak Reaction Force", f"{peak_reaction / 1000.0:.3f} kN", f"{peak_reaction:.1f} N")
+        c_col3.metric("Max ITZ Damage d_max", f"{final_damage_max:.3f}", f"{final_damage_max * 100.0:.1f}%")
+        c_col4.metric("Damaged ITZ Elements", f"{damaged_count} / {len(coh_mesh.cohesive_elements)}")
+
+        st.warning("""
+        **SCIENTIFIC & MODELLING LIMITATION NOTE**:
+        This simulation features nonlinear decohesion localized at the Interfacial Transition Zone (ITZ).
+        Bulk aggregate and mortar phases remain isotropic linear elastic (bulk cracking and crushing are not active).
+        Compressive failure of laboratory concrete is governed by both ITZ debonding and progressive matrix crushing.
+        The uncalibrated response curves below demonstrate constitutive interface mechanics and should not be cited
+        as validated physical concrete failure data without experimental calibration.
+        """)
+
+        st.subheader("4. Visualizations & Nonlinear Mechanics")
+        tab_curve, tab_damage, tab_mesh, tab_steps = st.tabs([
+            "Macroscopic Response Curves", "ITZ Damage Distribution", "Deformed Interface Mesh", "Convergence History"
+        ])
+
+        with tab_curve:
+            fig_curves, (ax_c1, ax_c2) = plt.subplots(1, 2, figsize=(12, 5), dpi=200)
+            
+            # Stress-Strain
+            ax_c1.plot(nl_res.strain_curve * 1000.0, nl_res.stress_curve, 'b-o', markersize=4, linewidth=1.5, label='Cohesive ITZ Model')
+            ax_c1.set_xlabel("Nominal Compressive Strain (‰ or mm/m)")
+            ax_c1.set_ylabel("Nominal Compressive Stress (MPa)")
+            ax_c1.set_title("Compressive Stress–Strain Response", fontsize=11)
+            ax_c1.grid(True, linestyle='--', alpha=0.6)
+            ax_c1.legend(loc='lower right')
+
+            # Force-Displacement
+            ax_c2.plot(nl_res.displacement_curve, nl_res.reaction_curve / 1000.0, 'r-s', markersize=4, linewidth=1.5, label='Vertical Reaction')
+            ax_c2.set_xlabel("Top Vertical Displacement Δy (mm)")
+            ax_c2.set_ylabel("Total Compressive Load (kN)")
+            ax_c2.set_title("Load–Displacement Curve", fontsize=11)
+            ax_c2.grid(True, linestyle='--', alpha=0.6)
+            ax_c2.legend(loc='lower right')
+
+            st.pyplot(fig_curves)
+
+        with tab_damage:
+            fig_dam, ax_dam = plt.subplots(figsize=(8, 7), dpi=200)
+            ax_dam.set_aspect('equal')
+
+            # Plot background aggregates and mortar
+            tri_patches = []
+            tri_colors = []
+            for i, tri in enumerate(coh_mesh.triangles):
+                pts = coh_mesh.nodes[tri]
+                tri_patches.append(MplPolygon(pts, closed=True))
+                tri_colors.append('#EAEAEA' if coh_mesh.phase[i] == 1 else '#D0E1F9')
+            p_coll = PatchCollection(tri_patches, facecolors=tri_colors, edgecolors='#CCCCCC', linewidths=0.2)
+            ax_dam.add_collection(p_coll)
+
+            # Overlay cohesive interface segments colored by damage d
+            elem_damage_vals = nl_res.final_state.element_damage
+            edge_lines = []
+            for elem in coh_mesh.cohesive_elements:
+                p1 = coh_mesh.nodes[elem.nodes_mor[0]]
+                p2 = coh_mesh.nodes[elem.nodes_mor[1]]
+                edge_lines.append([p1, p2])
+
+            damage_coll = LineCollection(
+                edge_lines,
+                array=elem_damage_vals,
+                cmap='plasma',
+                linewidths=2.5,
+                clim=(0.0, 1.0)
+            )
+            ax_dam.add_collection(damage_coll)
+            ax_dam.set_xlim(0, coh_mesh.domain_width)
+            ax_dam.set_ylim(0, coh_mesh.domain_height)
+            ax_dam.set_xlabel("X (mm)")
+            ax_dam.set_ylabel("Y (mm)")
+            ax_dam.set_title(f"Computed ITZ Damage Variable d ∈ [0, 1] ({damaged_count} damaged elements)", fontsize=11)
+
+            cbar_dam = plt.colorbar(damage_coll, ax=ax_dam, fraction=0.046, pad=0.04)
+            cbar_dam.set_label("Interface Damage d (0 = Intact, 1 = Fully Debonded)")
+
+            st.pyplot(fig_dam)
+
+        with tab_mesh:
+            def_mag = st.slider("Interface Crack Opening Magnification", min_value=1.0, max_value=200.0, value=25.0, step=5.0)
+            deformed_coords = coh_mesh.nodes + def_mag * nl_res.final_displacements
+
+            fig_def, ax_def = plt.subplots(figsize=(8, 7), dpi=200)
+            ax_def.set_aspect('equal')
+
+            def_patches = []
+            def_colors = []
+            for i, tri in enumerate(coh_mesh.triangles):
+                pts = deformed_coords[tri]
+                def_patches.append(MplPolygon(pts, closed=True))
+                def_colors.append('#F0F0F0' if coh_mesh.phase[i] == 1 else '#4A90E2')
+            def_coll = PatchCollection(def_patches, facecolors=def_colors, edgecolors='#444444', linewidths=0.25)
+            ax_def.add_collection(def_coll)
+
+            ax_def.plot(
+                [0, coh_mesh.domain_width, coh_mesh.domain_width, 0, 0],
+                [0, 0, coh_mesh.domain_height, coh_mesh.domain_height, 0],
+                'k--', linewidth=1.0, label='Undeformed Boundary'
+            )
+            ax_def.autoscale_view()
+            ax_def.set_xlabel("X (mm)")
+            ax_def.set_ylabel("Y (mm)")
+            ax_def.set_title(f"Deformed Mesostructure with Debonded ITZ (Displacements magnified {def_mag:.0f}×)", fontsize=11)
+            ax_def.legend(loc='upper right')
+
+            st.pyplot(fig_def)
+
+        with tab_steps:
+            history_rows = []
+            for s in nl_res.steps:
+                history_rows.append({
+                    "Step": s.step_index,
+                    "Load Factor λ": f"{s.load_factor:.3f}",
+                    "Top Disp (mm)": f"{s.displacement_top:.4f}",
+                    "Reaction (N)": f"{abs(s.reaction_force_top):.1f}",
+                    "Stress (MPa)": f"{s.nominal_compressive_stress:.2f}",
+                    "Strain (‰)": f"{s.nominal_vertical_strain * 1000.0:.3f}",
+                    "Iterations": s.num_iterations,
+                    "Residual Norm (N)": f"{s.equilibrium_residual:.2e}",
+                    "Max Damage": f"{s.max_damage:.3f}",
+                    "Damaged Elements": s.damaged_element_count
+                })
+            st.dataframe(pd.DataFrame(history_rows), use_container_width=True)
+
+# ==============================================================================
 # MAIN ROUTING
 # ==============================================================================
 
@@ -732,7 +982,13 @@ if __name__ == "__main__":
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        ["Phase 1: Mix Design", "Phase 2: Geometry Generation", "Phase 3: Conforming Mesh", "Phase 4: Linear FEM"]
+        [
+            "Phase 1: Mix Design",
+            "Phase 2: Geometry Generation",
+            "Phase 3: Conforming Mesh",
+            "Phase 4: Linear FEM",
+            "Phase 5: Cohesive ITZ"
+        ]
     )
     
     if page == "Phase 1: Mix Design":
@@ -741,5 +997,7 @@ if __name__ == "__main__":
         render_geometry_page()
     elif page == "Phase 3: Conforming Mesh":
         render_mesh_page()
-    else:
+    elif page == "Phase 4: Linear FEM":
         render_fem_page()
+    else:
+        render_cohesive_page()
