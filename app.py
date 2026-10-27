@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
-from matplotlib.collections import PatchCollection, LineCollection
+from matplotlib.collections import PatchCollection, LineCollection, PolyCollection
 from shapely.ops import nearest_points
 
 from core.mix_design import MixDesignInputs, calculate_mix_design
@@ -28,6 +28,9 @@ from core.meshing import (
     ConcreteMesh, InterfaceData
 )
 from core.mesh_checks import validate_mesh
+from core.fem import (
+    MaterialProperties, BoundaryConditions, solve_fem, FEMResult
+)
 
 st.set_page_config(page_title="Mesoscale Concrete Model", layout="wide")
 
@@ -528,16 +531,215 @@ def render_mesh_page():
         st.info("No concrete mesostructure found in current session. Please first generate an aggregate geometry in 'Phase 2: Geometry Generation'.")
 
 # ==============================================================================
+# PAGE 4: LINEAR FEM SOLVER (PHASE 4)
+# ==============================================================================
+
+def render_fem_page():
+    st.title("Phase 4: Linear-Elastic 2D Plane-Stress FEM Solver")
+    
+    st.markdown("""
+    Direct Finite Element Method (FEM) solver using **three-node constant-strain triangular (CST) elements**.
+    Solves displacement-controlled uniaxial compression on the boundary-conforming mesoscale concrete specimen.
+    
+    **Features & Principles:**
+    - Separate isotropic linear-elastic properties for **coarse aggregates** and **mortar matrix**.
+    - Displacement-controlled compression with customizable platen friction (frictionless vs sticking).
+    - Sparse matrix assembly and direct linear solver via `scipy.sparse`.
+    - Element strain recovery ($\epsilon_{xx}, \epsilon_{yy}, \gamma_{xy}$), Cauchy stresses ($\sigma_{xx}, \sigma_{yy}, \tau_{xy}$),
+      principal stresses ($\sigma_1, \sigma_2$), and von Mises equivalent stress ($\sigma_{vm}$).
+    - Reaction forces and global equilibrium verification ($\sum R_x \approx 0, \sum R_y^{top} + \sum R_y^{bottom} \approx 0$).
+    """)
+
+    if 'current_mesh' not in st.session_state:
+        st.info("No mesh found in current session. Please generate a mesh in **Phase 3: Conforming Mesh** before running the FEM solver.")
+        return
+
+    mesh: ConcreteMesh = st.session_state['current_mesh']
+    
+    st.subheader("1. Specimen Mesh Summary")
+    s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+    s_col1.metric("Domain Dimensions", f"{mesh.domain_width:.1f} × {mesh.domain_height:.1f} mm")
+    s_col2.metric("Nodes", len(mesh.nodes))
+    s_col3.metric("Triangles", len(mesh.triangles))
+    s_col4.metric("Degrees of Freedom", 2 * len(mesh.nodes))
+
+    st.subheader("2. Material Properties & Boundary Conditions")
+    
+    with st.expander("Configure Materials & Loading", expanded=True):
+        m_col1, m_col2 = st.columns(2)
+        
+        with m_col1:
+            st.markdown("##### Coarse Aggregate Phase")
+            e_agg = st.number_input("Aggregate Young's Modulus E_agg (MPa)", min_value=1000.0, max_value=150000.0, value=55000.0, step=1000.0)
+            nu_agg = st.number_input("Aggregate Poisson's Ratio ν_agg", min_value=0.05, max_value=0.45, value=0.20, step=0.01)
+            
+        with m_col2:
+            st.markdown("##### Mortar Matrix Phase")
+            e_mor = st.number_input("Mortar Young's Modulus E_mor (MPa)", min_value=1000.0, max_value=80000.0, value=25000.0, step=1000.0)
+            nu_mor = st.number_input("Mortar Poisson's Ratio ν_mor", min_value=0.05, max_value=0.45, value=0.20, step=0.01)
+
+        b_col1, b_col2, b_col3 = st.columns(3)
+        with b_col1:
+            disp_y = st.number_input("Top Vertical Displacement Δy (mm)", min_value=-2.0, max_value=-0.001, value=-0.05, step=0.005, format="%.4f")
+        with b_col2:
+            thickness = st.number_input("Specimen Thickness t (mm)", min_value=0.1, max_value=100.0, value=1.0, step=0.5)
+        with b_col3:
+            platen_mode = st.selectbox(
+                "Platen Boundary Condition",
+                ["Frictionless (Standard Uniaxial Benchmark)", "Rough / Sticking Platens (Restrained lateral X)"]
+            )
+            platen_friction = (platen_mode != "Frictionless (Standard Uniaxial Benchmark)")
+
+    run_fem_btn = st.button("Run Linear FEM Analysis", type="primary")
+
+    if run_fem_btn:
+        try:
+            with st.spinner("Assembling global stiffness matrix and solving linear system..."):
+                mat_aggregate = MaterialProperties(E=float(e_agg), nu=float(nu_agg), name="CoarseAggregate")
+                mat_mortar = MaterialProperties(E=float(e_mor), nu=float(nu_mor), name="MortarMatrix")
+                
+                bc = BoundaryConditions.for_uniaxial_compression(
+                    mesh=mesh,
+                    top_displacement=float(disp_y),
+                    platen_friction=platen_friction
+                )
+                
+                fem_res = solve_fem(
+                    mesh=mesh,
+                    mat_mortar=mat_mortar,
+                    mat_aggregate=mat_aggregate,
+                    bc=bc,
+                    thickness=float(thickness)
+                )
+                st.session_state['fem_result'] = fem_res
+                st.session_state['fem_params'] = {
+                    'e_agg': e_agg, 'nu_agg': nu_agg,
+                    'e_mor': e_mor, 'nu_mor': nu_mor,
+                    'disp_y': disp_y, 'thickness': thickness,
+                    'platen_mode': platen_mode
+                }
+        except Exception as e:
+            st.error(f"FEM Analysis failed: {str(e)}")
+            return
+
+    if 'fem_result' in st.session_state:
+        res: FEMResult = st.session_state['fem_result']
+        
+        st.subheader("3. Macro-Mechanical Response & Homogenized Metrics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Vertical Reaction |R_y|", f"{abs(res.total_reaction_top) / 1000.0:.3f} kN", f"{abs(res.total_reaction_top):.1f} N")
+        col2.metric("Nominal Compressive Stress", f"{res.nominal_compressive_stress:.2f} MPa")
+        col3.metric("Effective Young's Modulus", f"{res.effective_modulus:.1f} MPa")
+        col4.metric("Nominal Vertical Strain", f"{res.nominal_vertical_strain:.5f}")
+
+        eq_col1, eq_col2, eq_col3 = st.columns(3)
+        eq_col1.metric("Vertical Equilibrium Error |ΣRy|", f"{res.equilibrium_residual_y:.2e} N")
+        eq_col2.metric("Horizontal Equilibrium Error |ΣRx|", f"{res.equilibrium_residual_x:.2e} N")
+        eq_col3.metric("Solver Wall Time", f"{res.solve_time_seconds * 1000.0:.1f} ms")
+
+        st.warning("""
+        **SCIENTIFIC & MODELLING LIMITATION NOTE**:
+        This solver uses isotropic linear-elastic constant-strain triangular (CST) elements.
+        It simulates pre-peak elastic behavior and elastic stress concentrations.
+        It does **NOT** capture concrete micro-cracking, strain softening, shear dilatancy,
+        aggregate interlock, or nonlinear interfacial decohesion (cohesive ITZ).
+        The stresses displayed below represent elastic fields and must not be interpreted as damage or fracture patterns.
+        """)
+
+        st.subheader("4. Deformed Configuration & Stress Fields")
+        
+        viz_tab1, viz_tab2 = st.tabs(["Stress Field Visualization", "Deformed Mesh Configuration"])
+        
+        with viz_tab1:
+            stress_opts = {
+                "Vertical Normal Stress (σ_yy) [MPa]": (res.stresses[:, 1], 'coolwarm'),
+                "Lateral Normal Stress (σ_xx) [MPa]": (res.stresses[:, 0], 'coolwarm'),
+                "In-Plane Shear Stress (τ_xy) [MPa]": (res.stresses[:, 2], 'coolwarm'),
+                "von Mises Equivalent Stress (σ_vm) [MPa]": (res.von_mises, 'viridis'),
+                "Major Principal Stress (σ_1 - Tensile) [MPa]": (res.principal_stresses[:, 0], 'plasma'),
+                "Minor Principal Stress (σ_2 - Compressive) [MPa]": (res.principal_stresses[:, 1], 'coolwarm_r')
+            }
+            
+            selected_field_name = st.selectbox("Select Stress Component to Display", list(stress_opts.keys()))
+            field_values, cmap_name = stress_opts[selected_field_name]
+            
+            # PolyCollection for fast, crisp triangular stress map
+            tri_verts = [mesh.nodes[tri] for tri in mesh.triangles]
+            fig_stress, ax_stress = plt.subplots(figsize=(8, 7), dpi=200)
+            ax_stress.set_aspect('equal')
+            
+            poly_coll = PolyCollection(tri_verts, array=field_values, cmap=cmap_name, edgecolors='#333333', linewidths=0.2)
+            ax_stress.add_collection(poly_coll)
+            ax_stress.set_xlim(0, mesh.domain_width)
+            ax_stress.set_ylim(0, mesh.domain_height)
+            ax_stress.set_xlabel("X (mm)")
+            ax_stress.set_ylabel("Y (mm)")
+            ax_stress.set_title(f"Elastic Field: {selected_field_name}", fontsize=11)
+            
+            cbar = plt.colorbar(poly_coll, ax=ax_stress, fraction=0.046, pad=0.04)
+            cbar.set_label("Stress (MPa)")
+            
+            st.pyplot(fig_stress)
+            
+            # Phase-wise statistics
+            agg_vals = field_values[mesh.phase == 0]
+            mor_vals = field_values[mesh.phase == 1]
+            
+            stat_df = pd.DataFrame({
+                "Phase": ["Coarse Aggregate", "Mortar Matrix", "Entire Specimen"],
+                "Elements": [len(agg_vals), len(mor_vals), len(field_values)],
+                "Min (MPa)": [f"{np.min(agg_vals):.2f}", f"{np.min(mor_vals):.2f}", f"{np.min(field_values):.2f}"],
+                "Mean (MPa)": [f"{np.mean(agg_vals):.2f}", f"{np.mean(mor_vals):.2f}", f"{np.mean(field_values):.2f}"],
+                "Max (MPa)": [f"{np.max(agg_vals):.2f}", f"{np.max(mor_vals):.2f}", f"{np.max(field_values):.2f}"]
+            })
+            st.table(stat_df)
+            
+        with viz_tab2:
+            scale_factor = st.slider("Displacement Magnification Factor", min_value=1.0, max_value=500.0, value=50.0, step=5.0)
+            
+            deformed_nodes = mesh.nodes + scale_factor * res.displacements
+            
+            fig_def, ax_def = plt.subplots(figsize=(8, 7), dpi=200)
+            ax_def.set_aspect('equal')
+            
+            # Original outline
+            ax_def.plot(
+                [0, mesh.domain_width, mesh.domain_width, 0, 0],
+                [0, 0, mesh.domain_height, mesh.domain_height, 0],
+                'k--', linewidth=1.0, label='Undeformed Boundary'
+            )
+            
+            # Deformed triangles
+            def_verts = [deformed_nodes[tri] for tri in mesh.triangles]
+            colors = ['#4A90E2' if p == 0 else '#EAEAEA' for p in mesh.phase]
+            def_coll = PolyCollection(def_verts, facecolors=colors, edgecolors='#555555', linewidths=0.25)
+            ax_def.add_collection(def_coll)
+            
+            ax_def.autoscale_view()
+            ax_def.set_xlabel("X (mm)")
+            ax_def.set_ylabel("Y (mm)")
+            ax_def.set_title(f"Deformed Mesostructure (Displacements magnified {scale_factor:.0f}×)", fontsize=11)
+            ax_def.legend(loc='upper right')
+            
+            st.pyplot(fig_def)
+
+# ==============================================================================
 # MAIN ROUTING
 # ==============================================================================
 
 if __name__ == "__main__":
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ["Phase 1: Mix Design", "Phase 2: Geometry Generation", "Phase 3: Conforming Mesh"])
+    page = st.sidebar.radio(
+        "Go to",
+        ["Phase 1: Mix Design", "Phase 2: Geometry Generation", "Phase 3: Conforming Mesh", "Phase 4: Linear FEM"]
+    )
     
     if page == "Phase 1: Mix Design":
         render_mix_design_page()
     elif page == "Phase 2: Geometry Generation":
         render_geometry_page()
-    else:
+    elif page == "Phase 3: Conforming Mesh":
         render_mesh_page()
+    else:
+        render_fem_page()
