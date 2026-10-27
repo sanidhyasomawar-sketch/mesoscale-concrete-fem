@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / Coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Python Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+
+# Secrets and environment configurations
+.env
+.env.*
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+
+# Assistant sidecar metadata files
+*.metadata.json
+
+# Logs
+*.log
+
+# Large generated simulation files (ignore .npz by default; selective examples can be tracked)
+*.npz
