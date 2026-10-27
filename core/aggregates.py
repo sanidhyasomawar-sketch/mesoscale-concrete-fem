@@ -265,9 +265,9 @@ def sample_particle_sizes(
        - Sample candidate diameters d uniformly from [d_min, d_max].
        - Area of candidate: a = (pi / 4) * d^2.
        - Discard particles larger than the domain dimensions.
-       - Iteratively add particles until accumulated area is as close as possible
-         to A_k without arbitrary distortion.
-       - If A_k > 0, at least 1 particle is sampled if it fits the domain.
+       - Iteratively add particles only if doing so brings accumulated bin area closer
+         to A_k, preventing statistical over-allocation in sub-REV domains where a single
+         particle area exceeds the target bin area.
     2. Returns a list of SampledParticle objects sorted in descending order of diameter
        for standard Random Sequential Packing (RSP) placement.
     """
@@ -292,9 +292,12 @@ def sample_particle_sizes(
             d = rng.uniform(b.d_min, upper_bound)
             p_area = np.pi * (d / 2.0)**2
             
-            # Decision to add particle:
-            # If nothing placed yet, place first particle
-            if accumulated_bin_area == 0.0:
+            # Decision to add particle: Target-Proximity Criterion
+            # Evaluate whether adding this particle brings accumulated area closer to bin_target_area
+            diff_without = abs(bin_target_area - accumulated_bin_area)
+            diff_with = abs(bin_target_area - (accumulated_bin_area + p_area))
+            
+            if diff_with < diff_without or (accumulated_bin_area + p_area <= bin_target_area):
                 sampled_particles.append(SampledParticle(
                     diameter=d,
                     target_area=p_area,
@@ -303,21 +306,9 @@ def sample_particle_sizes(
                 ))
                 accumulated_bin_area += p_area
             else:
-                # Check if adding this particle improves proximity to target area
-                diff_without = abs(bin_target_area - accumulated_bin_area)
-                diff_with = abs(bin_target_area - (accumulated_bin_area + p_area))
-                
-                if diff_with < diff_without or (accumulated_bin_area + p_area <= bin_target_area):
-                    sampled_particles.append(SampledParticle(
-                        diameter=d,
-                        target_area=p_area,
-                        sieve_bin=b,
-                        bin_index=bin_idx
-                    ))
-                    accumulated_bin_area += p_area
-                else:
-                    # Stopping criterion reached for this bin
-                    break
+                # Stopping criterion reached for this bin:
+                # Adding this particle increases deviation from target bin area
+                break
                     
     # Sort descending by diameter so larger particles are placed first (standard RSA/RSP practice)
     sampled_particles.sort(key=lambda p: p.diameter, reverse=True)

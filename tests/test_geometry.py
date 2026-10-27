@@ -225,3 +225,83 @@ def test_morphology_descriptors():
     assert d_round.circularity > d_ang.circularity
     # Elongated particles have higher aspect ratio
     assert d_elong.aspect_ratio > d_round.aspect_ratio
+
+# ==============================================================================
+# 9. Target-Proximity Sampling & Specimen Scale Regressions
+# ==============================================================================
+
+def test_target_proximity_sampling_prevents_oversized_particle():
+    """Verify that an oversized particle is not forced into a bin when doing so worsens error."""
+    curve = get_default_grading_curve(nominal_max_size=20, curve_type="midpoint")
+    sieve_bins = compute_2d_area_fractions(curve, conversion_method="projected_area")
+    
+    W, H = 50.0, 50.0
+    target_frac = 0.35
+    target_total_area = W * H * target_frac  # 875 mm^2
+    
+    # Bin 0 (20-40 mm) target area is ~8.38 mm^2
+    bin0 = sieve_bins[0]
+    bin0_target_area = target_total_area * bin0.target_area_fraction
+    assert bin0_target_area < 10.0
+    
+    rng = np.random.default_rng(42)
+    sampled = sample_particle_sizes(
+        sieve_bins=sieve_bins,
+        target_total_area=target_total_area,
+        rng=rng,
+        domain_width=W,
+        domain_height=H
+    )
+    
+    # Check that no particles were forced into Bin 0 since any particle in [20, 40] mm
+    # has area >= pi/4 * 20^2 = 314 mm^2, which would drastically worsen the target error
+    bin0_sampled = [p for p in sampled if p.bin_index == 0]
+    assert len(bin0_sampled) == 0, "Oversized particle should not be forced into Bin 0 when target is only ~8.4 mm^2"
+
+
+def test_sub_rev_50mm_specimen_regression_seed_42():
+    """Verify that 50x50 mm specimen with NMAS 20 achieves ~37.65% (not 58.97%) with seed 42."""
+    curve = get_default_grading_curve(nominal_max_size=20, curve_type="midpoint")
+    W, H = 50.0, 50.0
+    target_frac = 0.35
+    
+    res = generate_mesostructure(
+        domain_width=W, domain_height=H, target_area_fraction=target_frac,
+        grading=curve, shape_class="angular", min_spacing=1.0, random_seed=42
+    )
+    
+    # Under proximity-based sampling, achieved fraction is ~37.65% (defectively was 58.97%)
+    assert 0.35 <= res.achieved_area_fraction <= 0.40
+    assert np.isclose(res.achieved_area_fraction, 0.3765, atol=0.01)
+    assert res.total_particles_placed == res.total_particles_sampled == 12
+    
+    # Verify geometry validation passes
+    val = validate_geometry(res.polygons, W, H, min_spacing=1.0)
+    assert val["all_polygons_valid"]
+    assert val["no_self_intersections"]
+    assert val["no_overlaps"]
+    assert val["spacing_satisfied"]
+    assert val["mortar_connected"]
+
+
+def test_rev_standard_specimen_150mm_area_fraction():
+    """Verify that standard 150x150 mm specimen matches target fraction accurately."""
+    curve = get_default_grading_curve(nominal_max_size=20, curve_type="midpoint")
+    W, H = 150.0, 150.0
+    target_frac = 0.35
+    
+    res = generate_mesostructure(
+        domain_width=W, domain_height=H, target_area_fraction=target_frac,
+        grading=curve, shape_class="angular", min_spacing=1.0, random_seed=42
+    )
+    
+    # For standard REV dimension (150 mm), error is under 1%
+    assert abs(res.achieved_area_fraction - target_frac) < 0.02
+    assert res.total_particles_placed == res.total_particles_sampled
+    assert res.total_particles_placed > 100
+    
+    val = validate_geometry(res.polygons, W, H, min_spacing=1.0)
+    assert val["all_polygons_valid"]
+    assert val["no_overlaps"]
+    assert val["spacing_satisfied"]
+

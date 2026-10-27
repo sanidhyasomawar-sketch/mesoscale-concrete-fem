@@ -207,11 +207,17 @@ def generate_mesostructure(
             # Inter-particle spacing and overlap check
             overlap = False
             if tree is not None:
-                # Buffer candidate by min_spacing to enforce minimum clearance
-                test_geom = candidate.buffer(min_spacing, quad_segs=4) if min_spacing > 0 else candidate
-                intersections = tree.query(test_geom, predicate="intersects")
-                if len(intersections) > 0:
-                    overlap = True
+                if min_spacing > 0:
+                    test_geom = candidate.buffer(min_spacing)
+                    potential_indices = tree.query(test_geom)
+                    for p_idx in potential_indices:
+                        if candidate.distance(placed_polygons[p_idx]) < min_spacing:
+                            overlap = True
+                            break
+                else:
+                    intersections = tree.query(candidate, predicate="intersects")
+                    if len(intersections) > 0:
+                        overlap = True
                     
             if not overlap:
                 # Candidate accepted!

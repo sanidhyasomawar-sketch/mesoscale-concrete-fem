@@ -171,14 +171,35 @@ def render_geometry_page():
         )
         
         col_w, col_h = st.columns(2)
-        domain_width = col_w.number_input("Width (mm)", value=150.0, step=10.0)
-        domain_height = col_h.number_input("Height (mm)", value=150.0, step=10.0)
+        domain_width = col_w.number_input(
+            "Width (mm)", value=150.0, step=10.0,
+            help="Suggested default: 150 × 150 mm for 20 mm aggregate to satisfy Representative Elementary Volume (REV)."
+        )
+        domain_height = col_h.number_input(
+            "Height (mm)", value=150.0, step=10.0,
+            help="Suggested default: 150 × 150 mm for 20 mm aggregate to satisfy Representative Elementary Volume (REV)."
+        )
         
         st.subheader("IS 383 Grading Setup")
         nom_size = st.selectbox(
             "Nominal Max Size", [10, 20, 40], 
             index=[10, 20, 40].index(default_size) if default_size in [10, 20, 40] else 1
         )
+        
+        # Representative Elementary Volume (REV) Advisory
+        min_dim = min(domain_width, domain_height)
+        rev_threshold = 3.0 * nom_size
+        if min_dim < rev_threshold:
+            st.warning(
+                f"⚠️ **Representative Elementary Volume (REV) Advisory**: Specimen dimension ({min_dim:g} mm) "
+                f"is smaller than the recommended REV threshold (≥ 3 × NMAS = {rev_threshold:g} mm) for {nom_size} mm aggregate. "
+                "Small specimens are convenient for quick smoke testing and debugging, but discrete particle sizing "
+                "means coarse grading bins may be statistically omitted or cause larger deviations from the target area fraction. "
+                "For reliable representation of the continuous grading curve, 150 × 150 mm is suggested for 20 mm aggregate "
+                "(or choose 10 mm NMAS for 50 × 50 mm specimens)."
+            )
+        else:
+            st.caption(f"✓ Specimen dimension ({min_dim:g} mm) satisfies the recommended REV scale (≥ 3 × NMAS = {rev_threshold:g} mm).")
         
         envelope_choice = st.selectbox(
             "Grading Curve Source", 
