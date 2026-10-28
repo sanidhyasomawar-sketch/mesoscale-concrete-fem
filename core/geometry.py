@@ -16,6 +16,7 @@ Scientific Protocol:
    an algorithmic RSP packing saturation limit.
 """
 
+import hashlib
 import numpy as np
 from shapely.geometry import Polygon, box
 from shapely.affinity import translate, rotate
@@ -83,6 +84,43 @@ class PackingResult:
     sieve_sizes: List[float]
     target_percent_passing: List[float]
     achieved_percent_passing: List[float]
+    geometry_fingerprint: str = ""
+
+    @property
+    def fingerprint(self) -> str:
+        if not self.geometry_fingerprint:
+            self.geometry_fingerprint = compute_geometry_fingerprint(
+                self.domain_width, self.domain_height, self.polygons
+            )
+        return self.geometry_fingerprint
+
+
+def compute_geometry_fingerprint(
+    domain_width: float,
+    domain_height: float,
+    polygons: List[Polygon]
+) -> str:
+    """
+    Computes a deterministic SHA-256 fingerprint for a concrete specimen geometry.
+    
+    Incorporates:
+    - Specimen dimensions (domain_width, domain_height)
+    - Total particle count
+    - Canonical sorted coordinates of each aggregate polygon exterior
+    """
+    hasher = hashlib.sha256()
+    hasher.update(f"DOMAIN:{domain_width:.4f}x{domain_height:.4f};COUNT:{len(polygons)};".encode("utf-8"))
+    
+    def poly_sort_key(p: Polygon):
+        c = p.centroid
+        return (round(c.x, 4), round(c.y, 4), round(p.area, 4))
+    
+    sorted_polys = sorted(polygons, key=poly_sort_key)
+    for idx, poly in enumerate(sorted_polys):
+        coords_str = ";".join(f"{x:.4f},{y:.4f}" for x, y in poly.exterior.coords)
+        hasher.update(f"P{idx}:{coords_str}|".encode("utf-8"))
+        
+    return hasher.hexdigest()[:16]
 
 
 def generate_mesostructure(
@@ -293,6 +331,8 @@ def generate_mesostructure(
         else:
             pct = 0.0
         achieved_percent_passing.append(round(pct, 2))
+
+    fingerprint = compute_geometry_fingerprint(domain_width, domain_height, placed_polygons)
         
     return PackingResult(
         target_area_fraction=target_area_fraction,
@@ -315,5 +355,6 @@ def generate_mesostructure(
         bin_reports=bin_reports,
         sieve_sizes=list(grading.sieve_sizes),
         target_percent_passing=list(grading.percent_passing),
-        achieved_percent_passing=achieved_percent_passing
+        achieved_percent_passing=achieved_percent_passing,
+        geometry_fingerprint=fingerprint
     )

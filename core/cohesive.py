@@ -177,6 +177,7 @@ class CohesiveMesh:
     original_node_count: int
     num_duplicated_nodes: int
     node_map: Dict[Tuple[int, int], int]  # (orig_node, agg_id) -> dup_node
+    geometry_fingerprint: str = ""
 
 
 # ==============================================================================
@@ -290,7 +291,8 @@ def build_cohesive_mesh(
         domain_height=mesh.domain_height,
         original_node_count=orig_count,
         num_duplicated_nodes=num_duplicated,
-        node_map=node_map
+        node_map=node_map,
+        geometry_fingerprint=getattr(mesh, 'geometry_fingerprint', '')
     )
 
 
@@ -600,6 +602,7 @@ class NonlinearFEMResult:
     reaction_curve: np.ndarray
     stress_curve: np.ndarray
     strain_curve: np.ndarray
+    geometry_fingerprint: str = ""
 
 
 def solve_cohesive_fem(
@@ -807,5 +810,6 @@ def solve_cohesive_fem(
         displacement_curve=disp_curve,
         reaction_curve=reaction_curve,
         stress_curve=stress_curve,
-        strain_curve=strain_curve
+        strain_curve=strain_curve,
+        geometry_fingerprint=getattr(coh_mesh, 'geometry_fingerprint', '')
     )

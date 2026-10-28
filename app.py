@@ -36,6 +36,8 @@ from core.cohesive import (
     solve_cohesive_fem, NonlinearFEMResult
 )
 
+from core.synchronization import check_mesh_synchronization, invalidate_downstream_state, check_result_provenance
+
 st.set_page_config(page_title="Mesoscale Concrete Model", layout="wide")
 
 # ==============================================================================
@@ -272,7 +274,11 @@ def render_geometry_page():
             validation = validate_geometry(
                 result.polygons, domain_width, domain_height, min_spacing=min_spacing
             )
+            # Invalidate all downstream meshes and simulation results from prior geometry
+            invalidated = invalidate_downstream_state(st.session_state, source="geometry")
             st.session_state['specimen_result'] = result
+            if invalidated:
+                st.info("ℹ️ Previous mesh and simulation results have been invalidated to maintain synchronization with this new geometry.")
             
         # 1. Summary Metrics
         st.header("Packing & Area Fraction Results")
@@ -409,6 +415,19 @@ def render_mesh_section(specimen: PackingResult):
     st.markdown("---")
     st.header("Phase 3: Conforming Triangular Mesh Generation")
     
+    current_mesh = st.session_state.get('current_mesh', None)
+    sync = check_mesh_synchronization(specimen, current_mesh)
+
+    if current_mesh is not None:
+        if not sync.is_synchronized:
+            st.warning(
+                f"⚠️ **Geometry updated**: {sync.message}\n\n"
+                f"- Active Phase 2 Geometry: `{sync.geometry_fingerprint}`\n"
+                f"- Previous Mesh Geometry: `{sync.mesh_fingerprint or 'None'}`"
+            )
+        else:
+            st.success(f"✓ **Mesh ready**: {sync.message} (Fingerprint: `{sync.geometry_fingerprint}`)")
+    
     st.markdown("""
     Generates a 2D boundary-conforming Constrained Delaunay Triangulation (CDT) using **Shewchuk's Triangle**.
     Enforces all aggregate polygon edges as fixed boundaries, assigns regional material tags ($0 = \text{Aggregate}$, $1 = \text{Mortar}$),
@@ -427,6 +446,8 @@ def render_mesh_section(specimen: PackingResult):
         try:
             t0 = time.perf_counter()
             with st.spinner("Generating Constrained Delaunay Triangulation via Triangle..."):
+                # Invalidate any downstream Phase 4 and Phase 5 simulation results
+                invalidate_downstream_state(st.session_state, source="mesh")
                 mesh, pre_report = generate_conforming_mesh(
                     domain_width=specimen.domain_width,
                     domain_height=specimen.domain_height,
@@ -435,7 +456,8 @@ def render_mesh_section(specimen: PackingResult):
                     target_edge_aggregate=target_edge_aggregate,
                     min_angle=min_angle,
                     max_triangles=int(max_triangles),
-                    run_pre_checks=True
+                    run_pre_checks=True,
+                    geometry_fingerprint=sync.geometry_fingerprint
                 )
                 if_data = extract_interface_data(mesh, specimen.polygons)
                 val_report = validate_mesh(
@@ -449,12 +471,14 @@ def render_mesh_section(specimen: PackingResult):
             st.session_state['current_if_data'] = if_data
             st.session_state['current_val_report'] = val_report
             st.session_state['current_mesh_time'] = mesh_time
+            st.success(f"✓ **Mesh ready**: Conforming mesh successfully generated and synchronized with Phase 2 geometry (Fingerprint: `{mesh.geometry_fingerprint}`).")
+            sync = check_mesh_synchronization(specimen, mesh)
             
         except Exception as e:
             st.error(f"Meshing failed: {str(e)}")
             return
 
-    if 'current_mesh' in st.session_state:
+    if 'current_mesh' in st.session_state and sync.is_synchronized:
         mesh: ConcreteMesh = st.session_state['current_mesh']
         if_data: InterfaceData = st.session_state['current_if_data']
         val_report = st.session_state['current_val_report']
@@ -575,11 +599,30 @@ def render_fem_page():
     - Reaction forces and global equilibrium verification ($\sum R_x \approx 0, \sum R_y^{top} + \sum R_y^{bottom} \approx 0$).
     """)
 
-    if 'current_mesh' not in st.session_state:
-        st.info("No mesh found in current session. Please generate a mesh in **Phase 3: Conforming Mesh** before running the FEM solver.")
+    specimen: Optional[PackingResult] = st.session_state.get('specimen_result', None)
+    current_mesh: Optional[ConcreteMesh] = st.session_state.get('current_mesh', None)
+    sync = check_mesh_synchronization(specimen, current_mesh)
+
+    if specimen is None:
+        st.info("No specimen geometry found in current session. Please first generate an aggregate geometry in **Phase 2: Geometry Generation**.")
         return
 
-    mesh: ConcreteMesh = st.session_state['current_mesh']
+    if current_mesh is None:
+        st.info("No conforming mesh found in current session. Please generate a mesh in **Phase 3: Conforming Mesh** before running the FEM solver.")
+        return
+
+    if not sync.is_synchronized:
+        st.warning(
+            f"⚠️ **Simulation blocked**: Phase 4 cannot run because the current mesh does not match the latest geometry. Regenerate the conforming mesh in Phase 3.\n\n"
+            f"- Active Phase 2 Geometry: `{sync.geometry_fingerprint}`\n"
+            f"- Existing Mesh Geometry: `{sync.mesh_fingerprint or 'None'}`"
+        )
+        return
+
+        return
+
+    mesh: ConcreteMesh = current_mesh
+    st.caption(f"✓ **Mesh synchronized**: Conforming mesh matches active Phase 2 geometry (Fingerprint: `{sync.geometry_fingerprint}`).")
     
     st.subheader("1. Specimen Mesh Summary")
     s_col1, s_col2, s_col3, s_col4 = st.columns(4)
@@ -649,6 +692,9 @@ def render_fem_page():
 
     if 'fem_result' in st.session_state:
         res: FEMResult = st.session_state['fem_result']
+        if not check_result_provenance(specimen, mesh, res):
+            st.warning("⚠️ **Outdated results**: The linear FEM results in memory do not match the current mesh and geometry. Please re-run the simulation above.")
+            return
         
         st.subheader("3. Macro-Mechanical Response & Homogenized Metrics")
         
@@ -769,11 +815,29 @@ def render_cohesive_page():
       automatic load step cutbacks, and isolated trial state tracking.
     """)
 
-    if 'current_mesh' not in st.session_state or 'current_if_data' not in st.session_state:
-        st.info("No conforming mesh with interface topology found in current session. Please generate a mesh in **Phase 3: Conforming Mesh** first.")
+    specimen: Optional[PackingResult] = st.session_state.get('specimen_result', None)
+    current_mesh: Optional[ConcreteMesh] = st.session_state.get('current_mesh', None)
+    if_data: Optional[InterfaceData] = st.session_state.get('current_if_data', None)
+    sync = check_mesh_synchronization(specimen, current_mesh)
+
+    if specimen is None:
+        st.info("No specimen geometry found in current session. Please first generate an aggregate geometry in **Phase 2: Geometry Generation**.")
         return
 
-    mesh: ConcreteMesh = st.session_state['current_mesh']
+    if current_mesh is None or if_data is None:
+        st.info("No conforming mesh found in current session. Please first generate a mesh in **Phase 3: Mesh Generation**.")
+        return
+
+    if not sync.is_synchronized:
+        st.error(
+            f"⚠️ **Simulation blocked**: Phase 5 cannot run because the current mesh does not match the latest geometry. Regenerate the conforming mesh in Phase 3.\n\n"
+            f"- Active Phase 2 Geometry: `{sync.geometry_fingerprint}`\n"
+            f"- Current Mesh Geometry: `{sync.mesh_fingerprint or 'None'}`"
+        )
+        return
+
+    mesh: ConcreteMesh = current_mesh
+    st.caption(f"✓ **Mesh synchronized**: Conforming mesh matches active Phase 2 geometry (Fingerprint: `{sync.geometry_fingerprint}`).")
     if_data: InterfaceData = st.session_state['current_if_data']
 
     if len(if_data.edges) == 0:
@@ -851,8 +915,11 @@ def render_cohesive_page():
             return
 
     if 'nl_res' in st.session_state:
-        coh_mesh: CohesiveMesh = st.session_state['coh_mesh']
         nl_res: NonlinearFEMResult = st.session_state['nl_res']
+        if not check_result_provenance(specimen, mesh, nl_res):
+            st.warning("⚠️ **Outdated results**: The nonlinear FEM results in memory do not match the current mesh and geometry. Please re-run the simulation above.")
+            return
+        coh_mesh: CohesiveMesh = st.session_state['coh_mesh']
         itz_props: ITZProperties = st.session_state['itz_props']
 
         st.subheader("3. Macro-Mechanical Nonlinear Response")

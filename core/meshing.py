@@ -13,6 +13,7 @@ Meshing Engine:
 
 import os
 import json
+from core.geometry import compute_geometry_fingerprint
 import numpy as np
 import triangle as tr
 from shapely.geometry import Polygon, Point, box
@@ -40,6 +41,7 @@ class ConcreteMesh:
     domain_height: float          # Height of specimen in mm
     mesh_params: Dict[str, Any]   # Target sizes, angles, max areas, and limits
     mesher_info: str = "Shewchuk Triangle (via python-triangle)"
+    geometry_fingerprint: str = ""
 
 
 @dataclass
@@ -94,7 +96,8 @@ def generate_conforming_mesh(
     max_triangles: int = 60000,
     run_pre_checks: bool = True,
     gap_fail_threshold: float = 0.15,
-    aggregate_ids: Optional[List[int]] = None
+    aggregate_ids: Optional[List[int]] = None,
+    geometry_fingerprint: Optional[str] = None
 ) -> Tuple[ConcreteMesh, PreMeshCheckReport]:
     """
     Generates a 2D boundary-conforming Constrained Delaunay Triangulation (CDT)
@@ -269,7 +272,8 @@ def generate_conforming_mesh(
         'max_triangles': max_triangles,
         'max_area_mortar': max_area_mortar,
         'max_area_aggregate': max_area_aggregate,
-        'switches': switches
+        'switches': switches,
+        'geometry_fingerprint': geometry_fingerprint if geometry_fingerprint else compute_geometry_fingerprint(domain_width, domain_height, polygons)
     }
 
     mesh = ConcreteMesh(
@@ -282,7 +286,8 @@ def generate_conforming_mesh(
         domain_width=domain_width,
         domain_height=domain_height,
         mesh_params=mesh_params,
-        mesher_info="Shewchuk Triangle (via python-triangle 20250106)"
+        mesher_info="Shewchuk Triangle (via python-triangle 20250106)",
+        geometry_fingerprint=geometry_fingerprint if geometry_fingerprint else compute_geometry_fingerprint(domain_width, domain_height, polygons)
     )
     
     return mesh, pre_report
@@ -445,7 +450,8 @@ def load_mesh_npz(filepath: str) -> Tuple[ConcreteMesh, Optional[InterfaceData]]
             domain_width=domain_width,
             domain_height=domain_height,
             mesh_params=mesh_params,
-            mesher_info="Shewchuk Triangle (restored from .npz)"
+            mesher_info="Shewchuk Triangle (restored from .npz)",
+            geometry_fingerprint=mesh_params.get('geometry_fingerprint', '')
         )
         
         interface = None

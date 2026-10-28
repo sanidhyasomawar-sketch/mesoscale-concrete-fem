@@ -313,6 +313,7 @@ class FEMResult:
     solve_time_seconds: float
     total_dofs: int
     thickness: float
+    geometry_fingerprint: str = ""
 
 
 # ==============================================================================
@@ -541,5 +542,6 @@ def solve_fem(
         equilibrium_residual_x=eq_res_x,
         solve_time_seconds=solve_time,
         total_dofs=total_dofs,
-        thickness=thickness
+        thickness=thickness,
+        geometry_fingerprint=getattr(mesh, 'geometry_fingerprint', '')
     )
