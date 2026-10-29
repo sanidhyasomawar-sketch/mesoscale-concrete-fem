@@ -28,8 +28,9 @@ import scipy.sparse.linalg as spla
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Any
 
-from core.meshing import ConcreteMesh, InterfaceData
+from core.meshing import ConcreteMesh, InterfaceData, compute_mesh_fingerprint
 from core.fem import MaterialProperties, cst_element_stiffness
+from core.mortar_damage import MortarDamageParameters, BulkMortarState
 
 
 # ==============================================================================
@@ -178,6 +179,7 @@ class CohesiveMesh:
     num_duplicated_nodes: int
     node_map: Dict[Tuple[int, int], int]  # (orig_node, agg_id) -> dup_node
     geometry_fingerprint: str = ""
+    mesh_fingerprint: str = ""
 
 
 # ==============================================================================
@@ -292,7 +294,8 @@ def build_cohesive_mesh(
         original_node_count=orig_count,
         num_duplicated_nodes=num_duplicated,
         node_map=node_map,
-        geometry_fingerprint=getattr(mesh, 'geometry_fingerprint', '')
+        geometry_fingerprint=getattr(mesh, 'geometry_fingerprint', ''),
+        mesh_fingerprint=compute_mesh_fingerprint(total_nodes, updated_triangles, mesh.phase, len(cohesive_elements))
     )
 
 
@@ -513,6 +516,99 @@ def assemble_cohesive_forces_and_stiffness(
     return f_coh, K_coh, trial_state
 
 
+def precompute_bulk_element_data(
+    coh_mesh: CohesiveMesh,
+    mat_mortar: MaterialProperties,
+    mat_aggregate: MaterialProperties,
+    thickness: float = 1.0,
+    mortar_damage_params: Optional[MortarDamageParameters] = None
+) -> Dict[str, Any]:
+    """
+    Precomputes constant geometric and linear-elastic quantities for all CST bulk elements in CohesiveMesh.
+    """
+    total_dofs = 2 * len(coh_mesh.nodes)
+    num_triangles = len(coh_mesh.triangles)
+    entries_per_element = 36
+    total_entries = num_triangles * entries_per_element
+
+    D_mortar = mat_mortar.plane_stress_D()
+    D_aggregate = mat_aggregate.plane_stress_D()
+
+    all_ke0 = np.zeros((num_triangles, 6, 6), dtype=np.float64)
+    all_B = np.zeros((num_triangles, 3, 6), dtype=np.float64)
+    all_A = np.zeros(num_triangles, dtype=np.float64)
+    all_he = np.zeros(num_triangles, dtype=np.float64)
+    all_dofs = np.zeros((num_triangles, 6), dtype=np.int32)
+
+    row_indices = np.zeros(total_entries, dtype=np.int32)
+    col_indices = np.zeros(total_entries, dtype=np.int32)
+
+    for e in range(num_triangles):
+        tri = coh_mesh.triangles[e]
+        phase = coh_mesh.phase[e]
+        D_elem = D_aggregate if phase == 0 else D_mortar
+        coords = coh_mesh.nodes[tri]
+        ke, B, A = cst_element_stiffness(coords, D_elem, thickness)
+
+        all_ke0[e] = ke
+        all_B[e] = B
+        all_A[e] = A
+        all_he[e] = np.sqrt(2.0 * A) if A > 0 else 0.0
+
+        dofs = np.array([
+            2 * tri[0], 2 * tri[0] + 1,
+            2 * tri[1], 2 * tri[1] + 1,
+            2 * tri[2], 2 * tri[2] + 1
+        ], dtype=np.int32)
+        all_dofs[e] = dofs
+
+        start_idx = e * entries_per_element
+        end_idx = start_idx + entries_per_element
+        row_indices[start_idx:end_idx] = np.repeat(dofs, 6)
+        col_indices[start_idx:end_idx] = np.tile(dofs, 6)
+
+    K_bulk_elastic = sp.coo_matrix(
+        (all_ke0.flatten(), (row_indices, col_indices)),
+        shape=(total_dofs, total_dofs),
+        dtype=np.float64
+    ).tocsr()
+
+    mortar_indices = np.where(coh_mesh.phase == 1)[0]
+    agg_indices = np.where(coh_mesh.phase == 0)[0]
+
+    eps_0 = 0.0
+    eps_u = np.zeros(num_triangles, dtype=np.float64)
+    d_max = 1.0
+    if mortar_damage_params is not None:
+        eps_0 = mortar_damage_params.eps_0
+        d_max = mortar_damage_params.d_max
+        w_c = mortar_damage_params.w_c
+        for idx in mortar_indices:
+            he = all_he[idx]
+            if he > 0:
+                eps_u[idx] = eps_0 + (w_c / he)
+            else:
+                eps_u[idx] = eps_0 + 1e-2
+
+    return {
+        'total_dofs': total_dofs,
+        'num_triangles': num_triangles,
+        'all_ke0': all_ke0,
+        'all_B': all_B,
+        'all_A': all_A,
+        'all_he': all_he,
+        'all_dofs': all_dofs,
+        'row_indices': row_indices,
+        'col_indices': col_indices,
+        'K_bulk_elastic': K_bulk_elastic,
+        'mortar_indices': mortar_indices,
+        'agg_indices': agg_indices,
+        'eps_0': eps_0,
+        'eps_u': eps_u,
+        'd_max': d_max
+    }
+
+
 def assemble_bulk_stiffness_matrix(
     coh_mesh: CohesiveMesh,
     mat_mortar: MaterialProperties,
@@ -521,47 +617,99 @@ def assemble_bulk_stiffness_matrix(
 ) -> sp.csr_matrix:
     """
     Assembles the constant linear-elastic stiffness matrix for all triangular bulk elements.
+    Preserved for backward compatibility.
     """
-    total_dofs = 2 * len(coh_mesh.nodes)
-    num_triangles = len(coh_mesh.triangles)
-    entries_per_element = 36
-    total_entries = num_triangles * entries_per_element
+    pre = precompute_bulk_element_data(coh_mesh, mat_mortar, mat_aggregate, thickness)
+    return pre['K_bulk_elastic']
 
-    row_indices = np.zeros(total_entries, dtype=np.int32)
-    col_indices = np.zeros(total_entries, dtype=np.int32)
-    matrix_values = np.zeros(total_entries, dtype=np.float64)
 
-    D_mortar = mat_mortar.plane_stress_D()
-    D_aggregate = mat_aggregate.plane_stress_D()
+def assemble_bulk_forces_and_stiffness(
+    coh_mesh: CohesiveMesh,
+    mat_mortar: MaterialProperties,
+    mat_aggregate: MaterialProperties,
+    u_full: np.ndarray,
+    mortar_state: Optional[BulkMortarState] = None,
+    mortar_damage_params: Optional[MortarDamageParameters] = None,
+    thickness: float = 1.0,
+    precomputed: Optional[Dict[str, Any]] = None
+) -> Tuple[np.ndarray, sp.csr_matrix, Optional[BulkMortarState]]:
+    """
+    Assembles internal forces and secant tangent stiffness for bulk elements.
+    If mortar_damage_params is None or mortar_state is None:
+        Returns K_bulk_elastic @ u_full, K_bulk_elastic, None
+    If mortar_damage_params is provided:
+        Evaluates Rankine equivalent tensile strain on mortar elements (phase == 1),
+        updates trial history kappa, evaluates trial damage d_trial,
+        scales mortar element stiffness by (1 - d_trial),
+        assembles K_bulk, computes f_bulk = K_bulk @ u_full, and returns trial_mortar_state.
+        Aggregate elements (phase == 0) remain 100% elastic (damage = 0).
+    """
+    if precomputed is None:
+        precomputed = precompute_bulk_element_data(
+            coh_mesh, mat_mortar, mat_aggregate, thickness, mortar_damage_params
+        )
 
-    for e in range(num_triangles):
-        tri = coh_mesh.triangles[e]
-        phase = coh_mesh.phase[e]
-        D_elem = D_aggregate if phase == 0 else D_mortar
+    if mortar_damage_params is None or mortar_state is None:
+        K_bulk = precomputed['K_bulk_elastic']
+        f_bulk = K_bulk @ u_full
+        return f_bulk, K_bulk, None
 
-        coords = coh_mesh.nodes[tri]
-        ke, _, _ = cst_element_stiffness(coords, D_elem, thickness)
+    all_dofs = precomputed['all_dofs']
+    all_B = precomputed['all_B']
+    all_ke0 = precomputed['all_ke0']
+    mortar_indices = precomputed['mortar_indices']
+    row_indices = precomputed['row_indices']
+    col_indices = precomputed['col_indices']
+    total_dofs = precomputed['total_dofs']
+    num_triangles = precomputed['num_triangles']
+    eps_0 = precomputed['eps_0']
+    eps_u = precomputed['eps_u']
+    d_max = precomputed['d_max']
 
-        dofs = np.array([
-            2 * tri[0], 2 * tri[0] + 1,
-            2 * tri[1], 2 * tri[1] + 1,
-            2 * tri[2], 2 * tri[2] + 1
-        ], dtype=np.int32)
+    trial_kappa = mortar_state.kappa.copy()
+    trial_damage = np.zeros(num_triangles, dtype=np.float64)
 
-        start_idx = e * entries_per_element
-        end_idx = start_idx + entries_per_element
+    if len(mortar_indices) > 0:
+        u_mortar = u_full[all_dofs[mortar_indices]]
+        strains = np.einsum('nij,nj->ni', all_B[mortar_indices], u_mortar)
 
-        row_indices[start_idx:end_idx] = np.repeat(dofs, 6)
-        col_indices[start_idx:end_idx] = np.tile(dofs, 6)
-        matrix_values[start_idx:end_idx] = ke.flatten()
+        center = 0.5 * (strains[:, 0] + strains[:, 1])
+        radius = np.sqrt((0.5 * (strains[:, 0] - strains[:, 1])) ** 2 + (0.5 * strains[:, 2]) ** 2)
+        eps_1 = center + radius
+        tilde_eps = np.maximum(0.0, eps_1)
+
+        k_old = mortar_state.kappa[mortar_indices]
+        k_trial_m = np.maximum(k_old, tilde_eps)
+        trial_kappa[mortar_indices] = k_trial_m
+
+        active = k_trial_m > eps_0
+        d_m = np.zeros(len(mortar_indices), dtype=np.float64)
+        if np.any(active):
+            eps_u_act = eps_u[mortar_indices][active]
+            k_act = k_trial_m[active]
+            d_ideal = (eps_u_act * (k_act - eps_0)) / (k_act * (eps_u_act - eps_0))
+            d_m[active] = np.minimum(d_ideal, d_max)
+
+        trial_damage[mortar_indices] = d_m
+
+    trial_is_damaged = (trial_damage > 1e-4)
+    trial_mortar_state = BulkMortarState(
+        kappa=trial_kappa,
+        damage=trial_damage,
+        is_damaged=trial_is_damaged
+    )
+
+    factors = 1.0 - trial_damage
+    scaled_ke = factors[:, None, None] * all_ke0
 
     K_bulk = sp.coo_matrix(
-        (matrix_values, (row_indices, col_indices)),
+        (scaled_ke.ravel(), (row_indices, col_indices)),
         shape=(total_dofs, total_dofs),
         dtype=np.float64
     ).tocsr()
 
-    return K_bulk
+    f_bulk = K_bulk @ u_full
+    return f_bulk, K_bulk, trial_mortar_state
 
 
 # ==============================================================================
@@ -585,6 +733,11 @@ class NonlinearStepResult:
     max_damage: float
     mean_damage: float
     damaged_element_count: int
+    convergence_method: str = "Force tolerance"
+    max_mortar_damage: float = 0.0
+    mean_mortar_damage: float = 0.0
+    damaged_mortar_count: int = 0
+    displacement_correction_norm: float = 0.0
 
 
 @dataclass
@@ -603,6 +756,19 @@ class NonlinearFEMResult:
     stress_curve: np.ndarray
     strain_curve: np.ndarray
     geometry_fingerprint: str = ""
+    mesh_fingerprint: str = ""
+    last_converged_load_factor: float = 0.0
+    actual_displacement_reached: float = 0.0
+    total_cutbacks: int = 0
+    total_iterations: int = 0
+    termination_reason: str = ""
+    force_tol: float = 1e-3
+    disp_tol: float = 1e-6
+    relaxed_force_tol: float = 1e-2
+    final_mortar_state: Optional[BulkMortarState] = None
+    max_mortar_damage: float = 0.0
+    damaged_mortar_count: int = 0
+    mortar_damage_curve: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
 
 
 def solve_cohesive_fem(
@@ -614,21 +780,50 @@ def solve_cohesive_fem(
     num_steps: int = 20,
     thickness: float = 1.0,
     platen_friction: bool = False,
-    max_iter_per_step: int = 25,
+    max_iter_per_step: int = 40,
     force_tol: float = 1e-3,
     disp_tol: float = 1e-6,
-    max_cutbacks: int = 4
+    max_cutbacks: int = 8,
+    mortar_damage_params: Optional[MortarDamageParameters] = None
 ) -> NonlinearFEMResult:
     """
-    Executes an incremental displacement-controlled Newton-Raphson solver for the cohesive mesoscale concrete model.
+    Executes an incremental displacement-controlled Newton-Raphson solver for the cohesive mesoscale concrete model,
+    with optional isotropic tensile damage in bulk mortar elements.
     """
+    # Input validation
+    if top_displacement >= 0.0:
+        raise ValueError(
+            f"Prescribed vertical displacement must be strictly negative for uniaxial compressive loading, "
+            f"got {top_displacement} mm."
+        )
+    if abs(top_displacement) >= coh_mesh.domain_height:
+        raise ValueError(
+            f"Prescribed vertical displacement magnitude ({abs(top_displacement):.4f} mm) cannot equal or exceed "
+            f"specimen height ({coh_mesh.domain_height:.1f} mm)."
+        )
+    if num_steps < 1:
+        raise ValueError(f"Number of load increments num_steps must be at least 1, got {num_steps}.")
+    if thickness <= 0.0:
+        raise ValueError(f"Specimen thickness must be strictly positive, got {thickness} mm.")
+    if max_iter_per_step < 1:
+        raise ValueError(f"Maximum iterations per step max_iter_per_step must be at least 1, got {max_iter_per_step}.")
+    if max_cutbacks < 0:
+        raise ValueError(f"Maximum cutbacks max_cutbacks must be non-negative, got {max_cutbacks}.")
+    if force_tol <= 0.0:
+        raise ValueError(f"Force tolerance force_tol must be strictly positive, got {force_tol}.")
+    if disp_tol <= 0.0:
+        raise ValueError(f"Displacement tolerance disp_tol must be strictly positive, got {disp_tol}.")
+
     t_start = time.perf_counter()
 
     total_dofs = 2 * len(coh_mesh.nodes)
     num_elems = len(coh_mesh.cohesive_elements)
+    num_triangles = len(coh_mesh.triangles)
 
-    # 1. Assemble constant linear bulk stiffness
-    K_bulk = assemble_bulk_stiffness_matrix(coh_mesh, mat_mortar, mat_aggregate, thickness)
+    # 1. Precompute bulk element data
+    precomputed_bulk = precompute_bulk_element_data(
+        coh_mesh, mat_mortar, mat_aggregate, thickness, mortar_damage_params
+    )
 
     # 2. Set up boundary DOFs
     bottom_nodes = coh_mesh.boundary_nodes['bottom']
@@ -665,48 +860,74 @@ def solve_cohesive_fem(
     is_prescribed[prescribed_indices] = True
     free_indices = np.where(~is_prescribed)[0]
 
-    # Initialize state
+    # Initialize cohesive state
     u_full = np.zeros(total_dofs, dtype=np.float64)
     state = CohesiveState.initialize(num_elems, itz_props.delta_n0)
 
+    # Initialize bulk mortar state if enabled
+    mortar_state: Optional[BulkMortarState] = None
+    if mortar_damage_params is not None:
+        mortar_state = BulkMortarState.initialize(
+            num_triangles, coh_mesh.phase, mortar_damage_params.eps_0
+        )
+
     step_results: List[NonlinearStepResult] = []
-    
+
     current_lambda = 0.0
-    d_lambda = 1.0 / num_steps
-    step_idx = 0
-    cutback_count = 0
+    d_lambda_initial = 1.0 / num_steps
+    d_lambda = d_lambda_initial
+    step_attempt = 0
+    consecutive_cutbacks = 0
+    total_cutbacks = 0
+    total_iterations = 0
+    steps_since_cutback = 0
+    prev_max_damage = 0.0
+    prev_dmg_count = 0
+    prev_max_mortar_damage = 0.0
+    prev_mortar_count = 0
 
     W = coh_mesh.domain_width
     H = coh_mesh.domain_height
     load_area = W * thickness
 
     while current_lambda < 1.0 - 1e-9:
-        step_idx += 1
+        step_attempt += 1
         target_lambda = min(1.0, current_lambda + d_lambda)
 
         # Store backup for cutback restoration
         u_backup = u_full.copy()
         state_backup = state.copy()
+        mortar_state_backup = mortar_state.copy() if mortar_state is not None else None
 
         converged = False
         iteration = 0
         eq_residual_val = 0.0
         trial_state = state.copy()
+        trial_mortar_state = mortar_state.copy() if mortar_state is not None else None
+        conv_method = ""
+        disp_norm_val = 0.0
 
         # Newton-Raphson equilibrium iterations
         while iteration < max_iter_per_step:
             iteration += 1
+            total_iterations += 1
 
             # Update prescribed displacement DOFs
             u_full[prescribed_indices] = target_lambda * prescribed_unit_vals
 
-            # Assemble internal forces and tangent stiffness
+            # Assemble bulk internal forces and tangent stiffness
+            f_bulk, K_bulk, trial_mortar_state = assemble_bulk_forces_and_stiffness(
+                coh_mesh, mat_mortar, mat_aggregate, u_full,
+                mortar_state, mortar_damage_params, thickness, precomputed_bulk
+            )
+
+            # Assemble cohesive internal forces and tangent stiffness
             f_coh, K_coh, trial_state = assemble_cohesive_forces_and_stiffness(
                 coh_mesh, itz_props, u_full, state, thickness
             )
 
-            # Total internal forces: f_int = K_bulk @ u + f_coh
-            f_int = K_bulk @ u_full + f_coh
+            # Total internal forces: f_int = f_bulk + f_coh
+            f_int = f_bulk + f_coh
 
             # Residual on free DOFs: r_f = -f_int[free] (f_ext = 0 on free DOFs)
             r_free = -f_int[free_indices]
@@ -716,9 +937,10 @@ def solve_cohesive_fem(
             # Convergence test: residual norm check
             if iteration > 1 and residual_norm < force_tol:
                 converged = True
+                conv_method = "Force tolerance"
                 break
 
-            # Tangent stiffness
+            # Total tangent stiffness
             K_total = K_bulk + K_coh
             K_ff = K_total[free_indices, :][:, free_indices]
 
@@ -734,16 +956,34 @@ def solve_cohesive_fem(
 
             u_full[free_indices] += du_free
             disp_norm = float(np.linalg.norm(du_free))
+            disp_norm_val = disp_norm
 
             if disp_norm < disp_tol and residual_norm < 10.0 * force_tol:
                 converged = True
+                conv_method = "Displacement correction + relaxed force tolerance"
                 break
 
         if converged:
-            # Commit trial state upon confirmed equilibrium convergence
+            # Re-evaluate internal forces, cohesive state, mortar state, and residual at final converged displacements
+            f_bulk, K_bulk, trial_mortar_state = assemble_bulk_forces_and_stiffness(
+                coh_mesh, mat_mortar, mat_aggregate, u_full,
+                mortar_state, mortar_damage_params, thickness, precomputed_bulk
+            )
+            f_coh, K_coh, trial_state = assemble_cohesive_forces_and_stiffness(
+                coh_mesh, itz_props, u_full, state, thickness
+            )
+            f_int = f_bulk + f_coh
+            r_free = -f_int[free_indices]
+            eq_residual_val = float(np.linalg.norm(r_free))
+
+            # Commit trial states upon confirmed equilibrium convergence
             current_lambda = target_lambda
             state = trial_state.copy()
-            cutback_count = 0  # reset cutback counter
+            if mortar_state is not None and trial_mortar_state is not None:
+                mortar_state = trial_mortar_state.copy()
+
+            consecutive_cutbacks = 0
+            steps_since_cutback += 1
 
             # Compute reactions: R = f_int
             reactions = f_int.reshape((-1, 2))
@@ -758,8 +998,16 @@ def solve_cohesive_fem(
             d_mean = float(np.mean(state.damage))
             d_count = int(np.sum(state.element_damage > 1e-4))
 
+            d_mortar_max = float(np.max(mortar_state.damage)) if mortar_state is not None else 0.0
+            d_mortar_mean = (
+                float(np.mean(mortar_state.damage[coh_mesh.phase == 1]))
+                if mortar_state is not None and np.any(coh_mesh.phase == 1)
+                else 0.0
+            )
+            d_mortar_count = int(np.sum(mortar_state.is_damaged)) if mortar_state is not None else 0
+
             step_res = NonlinearStepResult(
-                step_index=step_idx,
+                step_index=len(step_results) + 1,
                 load_factor=current_lambda,
                 displacement_top=float(current_lambda * top_displacement),
                 reaction_force_top=r_top,
@@ -770,35 +1018,74 @@ def solve_cohesive_fem(
                 equilibrium_residual=eq_residual_val,
                 max_damage=d_max,
                 mean_damage=d_mean,
-                damaged_element_count=d_count
+                damaged_element_count=d_count,
+                convergence_method=conv_method,
+                max_mortar_damage=d_mortar_max,
+                mean_mortar_damage=d_mortar_mean,
+                damaged_mortar_count=d_mortar_count,
+                displacement_correction_norm=disp_norm_val
             )
             step_results.append(step_res)
 
+            # Conservative adaptive step-size recovery
+            if d_lambda < d_lambda_initial - 1e-12:
+                if steps_since_cutback >= 2 and iteration <= 4:
+                    delta_dam = d_max - prev_max_damage
+                    delta_count = d_count - prev_dmg_count
+                    delta_m_dam = d_mortar_max - prev_max_mortar_damage
+                    delta_m_count = d_mortar_count - prev_mortar_count
+                    if delta_dam < 0.02 and delta_count <= 1 and delta_m_dam < 0.02 and delta_m_count <= 1:
+                        d_lambda = min(d_lambda * 1.25, d_lambda_initial)
+
+            prev_max_damage = d_max
+            prev_dmg_count = d_count
+            prev_max_mortar_damage = d_mortar_max
+            prev_mortar_count = d_mortar_count
+
         else:
             # Cutback required
-            cutback_count += 1
-            if cutback_count > max_cutbacks:
-                status = (
-                    f"Nonlinear solver failed to converge at load factor {current_lambda:.4f} "
-                    f"after {max_cutbacks} consecutive cutbacks. Results up to step {len(step_results)} returned."
-                )
+            consecutive_cutbacks += 1
+            total_cutbacks += 1
+            steps_since_cutback = 0
+            if consecutive_cutbacks > max_cutbacks:
                 break
-            
+
             # Halve step size and restore previous converged state
             d_lambda = d_lambda / 2.0
             u_full = u_backup.copy()
             state = state_backup.copy()
+            if mortar_state is not None:
+                mortar_state = mortar_state_backup.copy()
 
     total_time = time.perf_counter() - t_start
     overall_converged = (current_lambda >= 1.0 - 1e-5)
-    final_status = "Successfully converged all increments." if overall_converged else (
-        f"Terminated early at load factor {current_lambda:.3f}: cutback limit reached."
-    )
+
+    if overall_converged:
+        final_status = "Successfully converged all increments."
+        termination_reason = "Completed all prescribed increments to 100% load."
+    else:
+        final_status = f"Terminated early at load factor {current_lambda:.3f}: cutback limit reached."
+        termination_reason = (
+            f"Cutback limit reached: exceeded {max_cutbacks} consecutive non-convergent cutbacks "
+            f"at load factor λ = {current_lambda:.4f}."
+        )
+
+    actual_disp = float(current_lambda * top_displacement)
 
     disp_curve = np.array([abs(s.displacement_top) for s in step_results], dtype=np.float64)
     reaction_curve = np.array([abs(s.reaction_force_top) for s in step_results], dtype=np.float64)
     stress_curve = np.array([s.nominal_compressive_stress for s in step_results], dtype=np.float64)
     strain_curve = np.array([s.nominal_vertical_strain for s in step_results], dtype=np.float64)
+
+    final_mortar_dmg_max = float(np.max(mortar_state.damage)) if mortar_state is not None else 0.0
+    final_mortar_dmg_count = int(np.sum(mortar_state.is_damaged)) if mortar_state is not None else 0
+    mortar_dmg_curve = (
+        np.array([s.max_mortar_damage for s in step_results], dtype=np.float64)
+        if mortar_state is not None
+        else np.zeros(0, dtype=np.float64)
+    )
+
+    relaxed_force_tol = 10.0 * force_tol
 
     return NonlinearFEMResult(
         converged=overall_converged,
@@ -811,5 +1098,18 @@ def solve_cohesive_fem(
         reaction_curve=reaction_curve,
         stress_curve=stress_curve,
         strain_curve=strain_curve,
-        geometry_fingerprint=getattr(coh_mesh, 'geometry_fingerprint', '')
+        geometry_fingerprint=getattr(coh_mesh, 'geometry_fingerprint', ''),
+        mesh_fingerprint=getattr(coh_mesh, 'mesh_fingerprint', ''),
+        last_converged_load_factor=float(current_lambda),
+        actual_displacement_reached=actual_disp,
+        total_cutbacks=total_cutbacks,
+        total_iterations=total_iterations,
+        termination_reason=termination_reason,
+        force_tol=force_tol,
+        disp_tol=disp_tol,
+        relaxed_force_tol=relaxed_force_tol,
+        final_mortar_state=mortar_state,
+        max_mortar_damage=final_mortar_dmg_max,
+        damaged_mortar_count=final_mortar_dmg_count,
+        mortar_damage_curve=mortar_dmg_curve
     )

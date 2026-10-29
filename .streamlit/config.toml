@@ -1,0 +1,16 @@
+[theme]
+# Explicit light theme — overrides any OS/browser dark-mode preference.
+# primaryColor: accent blue used for primary buttons, sliders, radio selected state.
+# backgroundColor: main page background (off-white, not pure white).
+# secondaryBackgroundColor: sidebar and widget input surfaces.
+# textColor: primary body text (dark navy-charcoal, high contrast on both surfaces).
+base                    = "light"
+primaryColor            = "#2563EB"
+backgroundColor         = "#F8F9FA"
+secondaryBackgroundColor = "#EAECF0"
+textColor               = "#1A2332"
+font                    = "sans serif"
+
+[client]
+# Hide the Streamlit Deploy/Share toolbar to reduce chrome distraction in demos.
+toolbarMode = "minimal"

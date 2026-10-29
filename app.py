@@ -35,10 +35,17 @@ from core.cohesive import (
     ITZProperties, CohesiveMesh, CohesiveState, build_cohesive_mesh,
     solve_cohesive_fem, NonlinearFEMResult
 )
+from core.mortar_damage import (
+    MortarDamageParameters, plot_mortar_damage_distribution
+)
 
 from core.synchronization import check_mesh_synchronization, invalidate_downstream_state, check_result_provenance
 
+from ui.styles import inject_css
+from ui.landing import render_landing_page
+
 st.set_page_config(page_title="Mesoscale Concrete Model", layout="wide")
+inject_css()
 
 # ==============================================================================
 # PAGE 1: MIX DESIGN MODULE (IS 10262:2019)
@@ -58,28 +65,67 @@ def render_mix_design_page():
     
     with st.sidebar:
         st.header("Mix Design Inputs")
-        grade = st.selectbox("Concrete Grade", ["M20", "M25", "M30", "M35", "M40", "M45", "M50"], index=2)
+        grade = st.selectbox(
+            "Concrete Grade",
+            ["M20", "M25", "M30", "M35", "M40", "M45", "M50"],
+            index=2,
+            help="Target characteristic compressive strength (f_ck in MPa) per IS 456:2000."
+        )
         f_ck = float(grade[1:])
         
-        max_size = st.selectbox("Nominal Max Aggregate Size (mm)", [10, 20, 40], index=1)
-        fa_zone = st.selectbox("Fine Aggregate Zone", ["I", "II", "III", "IV"], index=1)
+        max_size = st.selectbox(
+            "Nominal Max Aggregate Size (mm)",
+            [10, 20, 40],
+            index=1,
+            help="Nominal Maximum Aggregate Size (NMAS in mm) per IS 383:2016 Table 7."
+        )
+        fa_zone = st.selectbox(
+            "Fine Aggregate Zone",
+            ["I", "II", "III", "IV"],
+            index=1,
+            help="Fine aggregate grading zone per IS 383:2016 Table 9."
+        )
         
-        slump = st.number_input("Target Slump (mm)", min_value=0, max_value=200, value=50, step=25)
+        slump = st.number_input(
+            "Target Slump (mm)",
+            min_value=0, max_value=200, value=50, step=25,
+            help="Target workability slump in mm."
+        )
         
         st.subheader("Durability & Exposure (IS 456 Table 5)")
-        max_wc_exposure = st.number_input("Max w/c Ratio", min_value=0.30, max_value=0.65, value=0.45, step=0.01)
-        min_cement_exposure = st.number_input("Min Cement Content (kg/m³)", min_value=250.0, max_value=450.0, value=320.0, step=10.0)
+        max_wc_exposure = st.number_input(
+            "Max w/c Ratio",
+            min_value=0.30, max_value=0.65, value=0.45, step=0.01,
+            help="Maximum permissible water-cement ratio for environmental durability."
+        )
+        min_cement_exposure = st.number_input(
+            "Min Cement Content (kg/m³)",
+            min_value=250.0, max_value=450.0, value=320.0, step=10.0,
+            help="Minimum cement content per IS 456 Table 5 (kg/m³)."
+        )
         
         st.subheader("Assumptions & Adjustments")
-        user_wc_strength = st.number_input("w/c Ratio for Target Strength (0 = use empirical)", min_value=0.0, max_value=0.70, value=0.0, step=0.01)
-        sp_reduction_pct = st.number_input("SP Water Reduction (%)", min_value=0.0, max_value=40.0, value=20.0, step=1.0)
-        sp_dosage_pct = st.number_input("SP Dosage (% by wt. cement)", min_value=0.0, max_value=3.0, value=1.0, step=0.1)
+        user_wc_strength = st.number_input(
+            "w/c Ratio for Target Strength (0 = use empirical)",
+            min_value=0.0, max_value=0.70, value=0.0, step=0.01,
+            help="Custom w/c ratio based on strength curves, or 0 for IS 10262 empirical defaults."
+        )
+        sp_reduction_pct = st.number_input(
+            "SP Water Reduction (%)",
+            min_value=0.0, max_value=40.0, value=20.0, step=1.0,
+            help="Water reduction percentage achieved by chemical admixture (%)."
+        )
+        sp_dosage_pct = st.number_input(
+            "SP Dosage (% by wt. cement)",
+            min_value=0.0, max_value=3.0, value=1.0, step=0.1,
+            help="Superplasticizer dosage by weight of cement (%)."
+        )
         
         st.subheader("Specific Gravities")
-        sg_cement = st.number_input("Cement", value=3.15, step=0.01)
-        sg_fa = st.number_input("Fine Aggregate", value=2.74, step=0.01)
-        sg_ca = st.number_input("Coarse Aggregate", value=2.74, step=0.01)
-        sg_sp = st.number_input("Superplasticizer", value=1.145, step=0.01)
+        sg_cement = st.number_input("Cement", value=3.15, step=0.01, help="Specific gravity of cement (dimensionless).")
+        sg_fa = st.number_input("Fine Aggregate", value=2.74, step=0.01, help="Specific gravity of fine aggregate (dimensionless).")
+        sg_ca = st.number_input("Coarse Aggregate", value=2.74, step=0.01, help="Specific gravity of coarse aggregate (dimensionless).")
+        sg_sp = st.number_input("Superplasticizer", value=1.145, step=0.01, help="Specific gravity of chemical admixture (dimensionless).")
         
         run_btn = st.button("Calculate Mix Design", type="primary")
 
@@ -245,9 +291,21 @@ def render_geometry_page():
         )
         conv_method = "projected_area" if "Stereological" in conv_method_label else "direct_analogue"
         
-        shape_class = st.selectbox("Morphology Class", ["angular", "rounded", "elongated"])
-        min_spacing = st.number_input("Min Aggregate Clearance (mm)", value=1.0, min_value=0.2, max_value=5.0, step=0.1)
-        random_seed = st.number_input("Random Seed", value=42, step=1)
+        shape_class = st.selectbox(
+            "Morphology Class",
+            ["angular", "rounded", "elongated"],
+            help="Parametric aggregate morphology class governing particle angularity and aspect ratio."
+        )
+        min_spacing = st.number_input(
+            "Min Aggregate Clearance (mm)",
+            value=1.0, min_value=0.2, max_value=5.0, step=0.1,
+            help="Minimum inter-particle surface clearance (mm) enforced during Random Sequential Packing."
+        )
+        random_seed = st.number_input(
+            "Random Seed",
+            value=42, step=1,
+            help="RNG seed for reproducible aggregate placement."
+        )
         
         run_btn = st.button("Generate Mesostructure", type="primary")
 
@@ -435,10 +493,26 @@ def render_mesh_section(specimen: PackingResult):
     """)
     
     col1, col2, col3, col4 = st.columns(4)
-    target_edge_mortar = col1.number_input("Mortar Target Edge (mm)", value=2.0, min_value=0.5, max_value=10.0, step=0.25)
-    target_edge_aggregate = col2.number_input("Aggregate Target Edge (mm)", value=3.5, min_value=0.5, max_value=15.0, step=0.5)
-    min_angle = col3.number_input("Min Angle (deg)", value=20.0, min_value=10.0, max_value=32.0, step=1.0)
-    max_triangles = col4.number_input("Max Element Cap", value=60000, step=5000)
+    target_edge_mortar = col1.number_input(
+        "Mortar Target Edge (mm)",
+        value=2.0, min_value=0.5, max_value=10.0, step=0.25,
+        help="Target CST element edge length in bulk mortar region (mm)."
+    )
+    target_edge_aggregate = col2.number_input(
+        "Aggregate Target Edge (mm)",
+        value=3.5, min_value=0.5, max_value=15.0, step=0.5,
+        help="Target CST element edge length within coarse aggregates (mm)."
+    )
+    min_angle = col3.number_input(
+        "Min Angle (deg)",
+        value=20.0, min_value=10.0, max_value=32.0, step=1.0,
+        help="Minimum interior triangle angle constraint enforced by Shewchuk's Triangle."
+    )
+    max_triangles = col4.number_input(
+        "Max Element Cap",
+        value=60000, step=5000,
+        help="Maximum total element cap to prevent excessive mesh refinement."
+    )
     
     mesh_btn = st.button("Generate Conforming Mesh", type="primary")
     
@@ -577,7 +651,11 @@ def render_mesh_page():
     if 'specimen_result' in st.session_state:
         render_mesh_section(st.session_state['specimen_result'])
     else:
-        st.info("No concrete mesostructure found in current session. Please first generate an aggregate geometry in 'Phase 2: Geometry Generation'.")
+        st.info(
+            "ℹ️ **No concrete mesostructure found in current session**: "
+            "Please first generate an aggregate geometry in **Phase 2: Geometry Generation** "
+            "before generating the conforming triangular mesh."
+        )
 
 # ==============================================================================
 # PAGE 4: LINEAR FEM SOLVER (PHASE 4)
@@ -604,11 +682,17 @@ def render_fem_page():
     sync = check_mesh_synchronization(specimen, current_mesh)
 
     if specimen is None:
-        st.info("No specimen geometry found in current session. Please first generate an aggregate geometry in **Phase 2: Geometry Generation**.")
+        st.info(
+            "ℹ️ **No specimen geometry found in current session**: "
+            "Please first generate an aggregate geometry in **Phase 2: Geometry Generation**."
+        )
         return
 
     if current_mesh is None:
-        st.info("No conforming mesh found in current session. Please generate a mesh in **Phase 3: Conforming Mesh** before running the FEM solver.")
+        st.info(
+            "ℹ️ **No conforming mesh found in current session**: "
+            "Please generate a boundary-conforming mesh in **Phase 3: Conforming Mesh** before running the linear FEM solver."
+        )
         return
 
     if not sync.is_synchronized:
@@ -638,23 +722,48 @@ def render_fem_page():
         
         with m_col1:
             st.markdown("##### Coarse Aggregate Phase")
-            e_agg = st.number_input("Aggregate Young's Modulus E_agg (MPa)", min_value=1000.0, max_value=150000.0, value=55000.0, step=1000.0)
-            nu_agg = st.number_input("Aggregate Poisson's Ratio ν_agg", min_value=0.05, max_value=0.45, value=0.20, step=0.01)
+            e_agg = st.number_input(
+                "Aggregate Young's Modulus E_agg (MPa)",
+                min_value=1000.0, max_value=150000.0, value=55000.0, step=1000.0,
+                help="Young's modulus of coarse aggregate inclusions (MPa)."
+            )
+            nu_agg = st.number_input(
+                "Aggregate Poisson's Ratio ν_agg",
+                min_value=0.05, max_value=0.45, value=0.20, step=0.01,
+                help="Poisson's ratio of coarse aggregate inclusions (dimensionless)."
+            )
             
         with m_col2:
             st.markdown("##### Mortar Matrix Phase")
-            e_mor = st.number_input("Mortar Young's Modulus E_mor (MPa)", min_value=1000.0, max_value=80000.0, value=25000.0, step=1000.0)
-            nu_mor = st.number_input("Mortar Poisson's Ratio ν_mor", min_value=0.05, max_value=0.45, value=0.20, step=0.01)
+            e_mor = st.number_input(
+                "Mortar Young's Modulus E_mor (MPa)",
+                min_value=1000.0, max_value=80000.0, value=25000.0, step=1000.0,
+                help="Young's modulus of mortar matrix (MPa)."
+            )
+            nu_mor = st.number_input(
+                "Mortar Poisson's Ratio ν_mor",
+                min_value=0.05, max_value=0.45, value=0.20, step=0.01,
+                help="Poisson's ratio of mortar matrix (dimensionless)."
+            )
 
         b_col1, b_col2, b_col3 = st.columns(3)
         with b_col1:
-            disp_y = st.number_input("Top Vertical Displacement Δy (mm)", min_value=-2.0, max_value=-0.001, value=-0.05, step=0.005, format="%.4f")
+            disp_y = st.number_input(
+                "Top Vertical Displacement Δy (mm)",
+                min_value=-2.0, max_value=-0.001, value=-0.05, step=0.005, format="%.4f",
+                help="Prescribed vertical compressive displacement on top platen (mm). Must be negative."
+            )
         with b_col2:
-            thickness = st.number_input("Specimen Thickness t (mm)", min_value=0.1, max_value=100.0, value=1.0, step=0.5)
+            thickness = st.number_input(
+                "Specimen Thickness t (mm)",
+                min_value=0.1, max_value=100.0, value=1.0, step=0.5,
+                help="Out-of-plane specimen thickness for 2D plane-stress formulation (mm)."
+            )
         with b_col3:
             platen_mode = st.selectbox(
                 "Platen Boundary Condition",
-                ["Frictionless (Standard Uniaxial Benchmark)", "Rough / Sticking Platens (Restrained lateral X)"]
+                ["Frictionless (Standard Uniaxial Benchmark)", "Rough / Sticking Platens (Restrained lateral X)"],
+                help="Platen boundary condition: frictionless (free lateral expansion) vs rough/sticking (zero lateral displacement at platens)."
             )
             platen_friction = (platen_mode != "Frictionless (Standard Uniaxial Benchmark)")
 
@@ -821,11 +930,17 @@ def render_cohesive_page():
     sync = check_mesh_synchronization(specimen, current_mesh)
 
     if specimen is None:
-        st.info("No specimen geometry found in current session. Please first generate an aggregate geometry in **Phase 2: Geometry Generation**.")
+        st.info(
+            "ℹ️ **No specimen geometry found in current session**: "
+            "Please first generate an aggregate geometry in **Phase 2: Geometry Generation**."
+        )
         return
 
     if current_mesh is None or if_data is None:
-        st.info("No conforming mesh found in current session. Please first generate a mesh in **Phase 3: Mesh Generation**.")
+        st.info(
+            "ℹ️ **No conforming mesh found in current session**: "
+            "Please first generate a conforming mesh in **Phase 3: Conforming Mesh** before running the cohesive FEM solver."
+        )
         return
 
     if not sync.is_synchronized:
@@ -858,10 +973,26 @@ def render_cohesive_page():
         
         with p_col1:
             st.markdown("##### Cohesive ITZ Properties")
-            kn_input = st.number_input("Normal Penalty Stiffness k_n (N/mm³)", value=1.0e5, min_value=1.0e3, max_value=1.0e7, step=1.0e4, format="%.2e")
-            kt_input = st.number_input("Tangential Stiffness k_t (N/mm³)", value=0.5e5, min_value=1.0e3, max_value=1.0e7, step=1.0e4, format="%.2e")
-            ft_input = st.number_input("ITZ Tensile Strength f_t (MPa)", value=2.5, min_value=0.2, max_value=20.0, step=0.1)
-            gf_input = st.number_input("ITZ Mode I Fracture Energy G_f (N/mm)", value=0.05, min_value=0.001, max_value=1.0, step=0.005, format="%.4f")
+            kn_input = st.number_input(
+                "Normal Penalty Stiffness k_n (N/mm³)",
+                value=1.0e5, min_value=1.0e3, max_value=1.0e7, step=1.0e4, format="%.2e",
+                help="Normal penalty dummy stiffness of zero-thickness cohesive interface elements (N/mm³)."
+            )
+            kt_input = st.number_input(
+                "Tangential Stiffness k_t (N/mm³)",
+                value=0.5e5, min_value=1.0e3, max_value=1.0e7, step=1.0e4, format="%.2e",
+                help="Tangential (shear) penalty stiffness of zero-thickness cohesive interface elements (N/mm³)."
+            )
+            ft_input = st.number_input(
+                "ITZ Tensile Strength f_t (MPa)",
+                value=2.5, min_value=0.2, max_value=20.0, step=0.1,
+                help="Tensile bond strength of the Interfacial Transition Zone (MPa)."
+            )
+            gf_input = st.number_input(
+                "ITZ Mode I Fracture Energy G_f (N/mm)",
+                value=0.05, min_value=0.001, max_value=1.0, step=0.005, format="%.4f",
+                help="Mode-I fracture energy of the ITZ interface (N/mm)."
+            )
             
             delta_n0 = (ft_input / kn_input) * 1000.0  # micrometers
             delta_nc = (2.0 * gf_input / ft_input) * 1000.0  # micrometers
@@ -869,22 +1000,118 @@ def render_cohesive_page():
             
         with p_col2:
             st.markdown("##### Bulk Material Elastic Moduli")
-            e_agg_c = st.number_input("Aggregate Young's Modulus E_agg (MPa)", value=55000.0, step=1000.0)
-            nu_agg_c = st.number_input("Aggregate Poisson's Ratio ν_agg", value=0.20, step=0.01)
-            e_mor_c = st.number_input("Mortar Young's Modulus E_mor (MPa)", value=25000.0, step=1000.0)
-            nu_mor_c = st.number_input("Mortar Poisson's Ratio ν_mor", value=0.20, step=0.01)
+            e_agg_c = st.number_input(
+                "Aggregate Young's Modulus E_agg (MPa)",
+                value=55000.0, step=1000.0,
+                help="Young's modulus of coarse aggregate inclusions (MPa)."
+            )
+            nu_agg_c = st.number_input(
+                "Aggregate Poisson's Ratio ν_agg",
+                value=0.20, step=0.01,
+                help="Poisson's ratio of coarse aggregate inclusions (dimensionless)."
+            )
+            e_mor_c = st.number_input(
+                "Mortar Young's Modulus E_mor (MPa)",
+                value=25000.0, step=1000.0,
+                help="Young's modulus of bulk mortar matrix (MPa)."
+            )
+            nu_mor_c = st.number_input(
+                "Mortar Poisson's Ratio ν_mor",
+                value=0.20, step=0.01,
+                help="Poisson's ratio of bulk mortar matrix (dimensionless)."
+            )
+
+            st.markdown("##### Bulk Mortar Tensile Damage (Phase 6)")
+            enable_mortar_damage = st.checkbox(
+                "Enable Bulk Mortar Tensile Softening",
+                value=True,
+                help="Enables isotropic tensile damage regularized by Bažant–Oh crack-band method for bulk mortar elements."
+            )
+            if enable_mortar_damage:
+                m_col1, m_col2 = st.columns(2)
+                ft_mor_c = m_col1.number_input("Mortar Tensile Strength f_t,m (MPa)", value=3.0, min_value=0.5, max_value=20.0, step=0.1)
+                gf_mor_c = m_col2.number_input("Mortar Fracture Energy G_f,m (N/mm)", value=0.08, min_value=0.005, max_value=1.0, step=0.005, format="%.4f")
 
         st.markdown("##### Loading & Numerical Solver Controls")
-        l_col1, l_col2, l_col3, l_col4 = st.columns(4)
-        disp_top_c = l_col1.number_input("Imposed Top Displacement Δy (mm)", value=-0.04, min_value=-1.0, max_value=-0.001, step=0.005, format="%.4f")
-        n_steps_c = l_col2.number_input("Load Increments", value=15, min_value=5, max_value=50, step=5)
-        thickness_c = l_col3.number_input("Specimen Thickness t (mm)", value=1.0, min_value=0.1, max_value=50.0, step=0.5)
-        platen_c = l_col4.selectbox("Platen Friction", ["Frictionless Platens", "Rough / Sticking Platens"])
+        l_col1, l_col2, l_col3 = st.columns(3)
+        disp_top_c = l_col1.number_input(
+            "Prescribed Vertical Displacement (mm)",
+            value=-0.04,
+            min_value=-2.0,
+            max_value=-0.0001,
+            step=0.01,
+            format="%.4f",
+            help="Prescribed downward compressive displacement applied to the top platen (mm). Must be negative for uniaxial compression."
+        )
+        thickness_c = l_col2.number_input(
+            "Specimen Thickness t (mm)",
+            value=1.0, min_value=0.1, max_value=50.0, step=0.5,
+            help="Out-of-plane specimen thickness for 2D plane-stress formulation (mm)."
+        )
+        platen_c = l_col3.selectbox(
+            "Platen Friction",
+            ["Frictionless Platens", "Rough / Sticking Platens"],
+            help="Frictionless platens (standard uniaxial benchmark) or rough sticking platens with restrained lateral X displacement."
+        )
         platen_fric_bool = (platen_c != "Frictionless Platens")
 
+        with st.expander("⚙️ Advanced Solver Settings", expanded=False):
+            s_col1, s_col2, s_col3 = st.columns(3)
+            n_steps_c = s_col1.number_input(
+                "Number of Initial Load Steps",
+                value=15,
+                min_value=5,
+                max_value=100,
+                step=5,
+                help="Initial number of incremental displacement steps (dλ_0 = 1 / num_steps)."
+            )
+            max_iter_c = s_col2.number_input(
+                "Max Newton Iterations per Step",
+                value=40,
+                min_value=10,
+                max_value=100,
+                step=5,
+                help="Maximum equilibrium iterations allowed before triggering a cutback (default 40)."
+            )
+            max_cutbacks_c = s_col3.number_input(
+                "Maximum Cutbacks",
+                value=8,
+                min_value=1,
+                max_value=16,
+                step=1,
+                help="Maximum consecutive step-halvings permitted before early termination (default 8)."
+            )
+
+        nominal_strain_disp = abs(float(disp_top_c)) / mesh.domain_height
+        st.caption(
+            f"**Nominal Imposed Vertical Strain:** $\epsilon = {nominal_strain_disp * 1000.0:.3f}\text{{ mm/m}}$ "
+            f"($\epsilon = {nominal_strain_disp:.5f}$, or ${nominal_strain_disp * 100.0:.3f}\%$) for $H = {mesh.domain_height:.1f}\text{{ mm}}$."
+        )
+        if mesh.domain_height >= 100.0 and nominal_strain_disp < 0.0005:
+            st.info(
+                f"ℹ️ **Specimen Height & Strain Guidance**: Imposed $\Delta y = {disp_top_c:.4f}\text{{ mm}}$ produces a low nominal strain of "
+                f"**{nominal_strain_disp * 1000.0:.2f} mm/m** on this {mesh.domain_height:.0f} mm specimen. In laboratory concrete compression, "
+                "initial micro-cracking develops at low strains while peak compressive stresses typically occur at 1.5–3.5 mm/m. "
+                "At current strain levels, only a few isolated ITZ elements initiate damage, resulting in a virtually linear macroscopic curve. "
+                "To explore higher ITZ decohesion on tall specimens, you may evaluate larger displacements (e.g. Δy = −0.08 to −0.12 mm). "
+                "Note: Bulk mortar crushing and matrix fracture remain inactive in this linear-elastic continuum formulation."
+            )
+
+        disp_valid = True
+        if disp_top_c >= 0.0:
+            st.error("⚠️ **Input Error**: Prescribed vertical displacement must be strictly negative for compressive loading (e.g. -0.04, -0.08, -0.10, -0.12, -0.20 mm).")
+            disp_valid = False
+        elif abs(disp_top_c) >= mesh.domain_height:
+            st.error(f"⚠️ **Input Error**: Prescribed displacement ({disp_top_c:.4f} mm) cannot equal or exceed specimen height ({mesh.domain_height:.1f} mm).")
+            disp_valid = False
+        elif nominal_strain_disp > 0.05:
+            st.warning("⚠️ **High Strain Warning**: Prescribed displacement produces > 5% strain. Infinitesimal strain CST assumptions become less accurate at large deformations.")
     run_nl_btn = st.button("Run Nonlinear Cohesive FEM Analysis", type="primary")
 
     if run_nl_btn:
+        if not disp_valid:
+            st.error("Cannot run simulation: Please correct the invalid displacement input above.")
+            return
         try:
             with st.spinner("Building cohesive mesh with duplicated interface nodes..."):
                 coh_mesh = build_cohesive_mesh(mesh, if_data)
@@ -893,6 +1120,17 @@ def render_cohesive_page():
                 itz_props = ITZProperties(k_n=float(kn_input), k_t=float(kt_input), f_t=float(ft_input), G_f=float(gf_input))
 
             with st.spinner(f"Solving {int(n_steps_c)} nonlinear Newton-Raphson load increments..."):
+                mortar_dam_params = None
+                if enable_mortar_damage:
+                    mortar_dam_params = MortarDamageParameters(
+                        E_m=float(e_mor_c),
+                        nu_m=float(nu_mor_c),
+                        f_t=float(ft_mor_c),
+                        G_f=float(gf_mor_c),
+                        h_e=2.5,
+                        alpha_res=1e-6
+                    )
+
                 nl_res = solve_cohesive_fem(
                     coh_mesh=coh_mesh,
                     mat_mortar=mat_mor,
@@ -902,8 +1140,10 @@ def render_cohesive_page():
                     num_steps=int(n_steps_c),
                     thickness=float(thickness_c),
                     platen_friction=platen_fric_bool,
-                    max_iter_per_step=25,
-                    force_tol=1e-2
+                    max_iter_per_step=int(max_iter_c),
+                    force_tol=1e-2,
+                    max_cutbacks=int(max_cutbacks_c),
+                    mortar_damage_params=mortar_dam_params
                 )
                 
             st.session_state['coh_mesh'] = coh_mesh
@@ -925,20 +1165,55 @@ def render_cohesive_page():
         st.subheader("3. Macro-Mechanical Nonlinear Response")
 
         if nl_res.converged:
-            st.success(f"Solver Status: {nl_res.status_message} (Completed in {nl_res.total_time_seconds:.2f} s)")
+            st.success(
+                f"**Solver Status**: {nl_res.status_message} (Completed in {nl_res.total_time_seconds:.2f} s)\n\n"
+                f"- **Termination Reason**: {nl_res.termination_reason}\n"
+                f"- **Last Converged Load Factor (λ)**: {nl_res.last_converged_load_factor:.4f} (100.0% of prescribed)\n"
+                f"- **Actual Displacement Reached**: {nl_res.actual_displacement_reached:.4f} mm\n"
+                f"- **Total Cutbacks Taken**: {nl_res.total_cutbacks}\n"
+                f"- **Total Newton Iterations**: {nl_res.total_iterations}"
+            )
         else:
-            st.warning(f"Solver Status: {nl_res.status_message}")
+            st.warning(
+                f"**Solver Status**: {nl_res.status_message} (Elapsed: {nl_res.total_time_seconds:.2f} s)\n\n"
+                f"- **Termination Reason**: {nl_res.termination_reason}\n"
+                f"- **Last Converged Load Factor (λ)**: {nl_res.last_converged_load_factor:.4f} ({nl_res.last_converged_load_factor * 100.0:.1f}% of prescribed)\n"
+                f"- **Actual Displacement Reached**: {nl_res.actual_displacement_reached:.4f} mm\n"
+                f"- **Total Cutbacks Taken**: {nl_res.total_cutbacks}\n"
+                f"- **Total Newton Iterations**: {nl_res.total_iterations}"
+            )
 
         peak_stress = float(np.max(nl_res.stress_curve)) if len(nl_res.stress_curve) > 0 else 0.0
         peak_reaction = float(np.max(nl_res.reaction_curve)) if len(nl_res.reaction_curve) > 0 else 0.0
         final_damage_max = float(np.max(nl_res.final_state.damage))
-        damaged_count = int(np.sum(nl_res.final_state.element_damage > 1e-3))
+        damaged_count = int(np.sum(nl_res.final_state.element_damage > 1e-4))
 
-        c_col1, c_col2, c_col3, c_col4 = st.columns(4)
+        applied_disp = float(abs(nl_res.displacement_curve[-1])) if len(nl_res.displacement_curve) > 0 else abs(float(disp_top_c))
+        peak_strain = float(np.max(nl_res.strain_curve)) if len(nl_res.strain_curve) > 0 else 0.0
+        c_col1, c_col2, c_col3, c_col4, c_col5 = st.columns(5)
         c_col1.metric("Peak Compressive Stress", f"{peak_stress:.2f} MPa")
         c_col2.metric("Peak Reaction Force", f"{peak_reaction / 1000.0:.3f} kN", f"{peak_reaction:.1f} N")
-        c_col3.metric("Max ITZ Damage d_max", f"{final_damage_max:.3f}", f"{final_damage_max * 100.0:.1f}%")
-        c_col4.metric("Damaged ITZ Elements", f"{damaged_count} / {len(coh_mesh.cohesive_elements)}")
+        c_col3.metric("Applied Displacement", f"-{applied_disp:.4f} mm", f"Strain: {peak_strain * 1000.0:.2f} mm/m")
+        c_col4.metric("Max ITZ Damage d_max", f"{final_damage_max:.3f}", f"{final_damage_max * 100.0:.1f}%")
+        c_col5.metric("Damaged ITZ Elements", f"{damaged_count} / {len(coh_mesh.cohesive_elements)}")
+
+        # Separate Mortar Damage Metric Cards
+        total_mortar_elems = int(np.sum(coh_mesh.phase == 1))
+        final_mortar_max = getattr(nl_res, 'max_mortar_damage', 0.0)
+        final_mortar_count = getattr(nl_res, 'damaged_mortar_count', 0)
+        mortar_state = getattr(nl_res, 'final_mortar_state', None)
+        mean_mortar_dmg = (
+            float(np.mean(mortar_state.damage[coh_mesh.phase == 1]))
+            if mortar_state is not None and total_mortar_elems > 0
+            else 0.0
+        )
+
+        st.markdown("##### Separate Damage Model Status")
+        d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+        d_col1.metric("ITZ Cohesive Status", f"{damaged_count} / {len(coh_mesh.cohesive_elements)} Debonded", f"Max d_itz: {final_damage_max:.3f}")
+        d_col2.metric("Mortar Tensile Status", f"{final_mortar_count} / {total_mortar_elems} Softening", f"Max d_m: {final_mortar_max:.3f}")
+        d_col3.metric("Mean Mortar Damage", f"{mean_mortar_dmg:.4f}")
+        d_col4.metric("Mortar Formulation", "Tensile Crack-Band" if mortar_state is not None else "Linear Elastic")
 
         st.warning("""
         **SCIENTIFIC & MODELLING LIMITATION NOTE**:
@@ -949,9 +1224,22 @@ def render_cohesive_page():
         as validated physical concrete failure data without experimental calibration.
         """)
 
+        st.info(
+            "📐 **Mesh Discretization & ITZ Sensitivity Note**: "
+            "Cohesive interface elements are placed along conforming aggregate-mortar boundaries extracted in Phase 3. "
+            "A standard mesh setting (mortar edge 3.5 mm, aggregate edge 5.0 mm) yields ~1297 ITZ segments, whereas a fine "
+            "mesh setting (mortar edge 2.0 mm, aggregate edge 3.5 mm) yields ~1952 to 2086 ITZ segments on a 150×150 mm specimen. "
+            "Because discrete interface compliance and localized energy dissipation depend on facet discretization length, "
+            "these represent two distinct numerical discretizations of the specimen and should not be compared as identical meshes."
+        )
+
         st.subheader("4. Visualizations & Nonlinear Mechanics")
-        tab_curve, tab_damage, tab_mesh, tab_steps = st.tabs([
-            "Macroscopic Response Curves", "ITZ Damage Distribution", "Deformed Interface Mesh", "Convergence History"
+        tab_curve, tab_damage, tab_mortar_damage, tab_mesh, tab_steps = st.tabs([
+            "Macroscopic Response Curves",
+            "ITZ Damage Distribution",
+            "Mortar Damage Distribution",
+            "Deformed Interface Mesh",
+            "Convergence History"
         ])
 
         with tab_curve:
@@ -1016,6 +1304,23 @@ def render_cohesive_page():
 
             st.pyplot(fig_dam)
 
+        with tab_mortar_damage:
+            st.markdown(
+                "**Bulk Mortar Tensile Damage ($d_m \\in [0, 1 - \\alpha_{\\text{res}}])$**: "
+                "Isotropic continuum damage regularized by the Bažant–Oh crack-band method based on Rankine "
+                "maximum principal tensile strain ($\\varepsilon_1 > \\varepsilon_0 = f_t / E_m$). "
+                "Aggregate elements remain elastic (gray). Cohesive ITZ elements are overlaid as discrete boundaries."
+            )
+            fig_m_dam, ax_m_dam, has_m_data = plot_mortar_damage_distribution(coh_mesh, nl_res)
+            if has_m_data and fig_m_dam is not None:
+                st.pyplot(fig_m_dam)
+            else:
+                st.info(
+                    "ℹ️ **Bulk mortar damage visualization unavailable**: Bulk mortar damage was not enabled "
+                    "or recorded for this run. Enable 'Bulk Mortar Tensile Softening' in the configuration panel above "
+                    "to simulate and visualize continuum damage in the mortar matrix."
+                )
+
         with tab_mesh:
             def_mag = st.slider("Interface Crack Opening Magnification", min_value=1.0, max_value=200.0, value=25.0, step=5.0)
             deformed_coords = coh_mesh.nodes + def_mag * nl_res.final_displacements
@@ -1046,6 +1351,29 @@ def render_cohesive_page():
             st.pyplot(fig_def)
 
         with tab_steps:
+            st.markdown(
+                f"**Convergence Summary**: Last Converged $\\lambda = {nl_res.last_converged_load_factor:.4f}$, "
+                f"Actual Displacement $= {nl_res.actual_displacement_reached:.4f}\\text{{ mm}}$, "
+                f"Total Cutbacks $= {nl_res.total_cutbacks}$, "
+                f"Total Newton Iterations $= {nl_res.total_iterations}$."
+            )
+            st.caption(f"*Termination Reason*: {nl_res.termination_reason}")
+
+            f_tol = getattr(nl_res, 'force_tol', 1e-2)
+            d_tol = getattr(nl_res, 'disp_tol', 1e-6)
+            rel_f_tol = getattr(nl_res, 'relaxed_force_tol', 10.0 * f_tol)
+
+            st.info(
+                f"ℹ️ **Solver Convergence & Tolerance Criteria**:\n\n"
+                f"- **Strict Force Tolerance ($\|\\mathbf{{r}}_{{free}}\|_2 < \\text{{force\\_tol}}$)**: `{f_tol:.4f} N`\n"
+                f"- **Displacement Correction Tolerance ($\|\\Delta \\mathbf{{u}}_{{free}}\|_2 < \\text{{disp\\_tol}}$)**: `{d_tol:.1e} mm` (1 nm)\n"
+                f"- **Relaxed Force Bound ($10 \\times \\text{{force\\_tol}}$)**: `{rel_f_tol:.4f} N`\n\n"
+                f"*Note*: In non-linear softening regimes with extensive localized ITZ damage, increments frequently converge when "
+                f"incremental displacement corrections drop to the nanoscale (`disp_tol`), provided the residual force norm is bounded by "
+                f"the relaxed limit (`{rel_f_tol:.4f} N`). Such increments are explicitly designated in the table below as "
+                f"**Displacement correction + relaxed force tolerance** to distinguish them from strict force tolerance convergence."
+            )
+
             history_rows = []
             for s in nl_res.steps:
                 history_rows.append({
@@ -1057,8 +1385,11 @@ def render_cohesive_page():
                     "Strain (‰)": f"{s.nominal_vertical_strain * 1000.0:.3f}",
                     "Iterations": s.num_iterations,
                     "Residual Norm (N)": f"{s.equilibrium_residual:.2e}",
-                    "Max Damage": f"{s.max_damage:.3f}",
-                    "Damaged Elements": s.damaged_element_count
+                    "Convergence Method": getattr(s, 'convergence_method', 'Force tolerance'),
+                    "Max ITZ Dmg": f"{s.max_damage:.3f}",
+                    "Damaged ITZ": s.damaged_element_count,
+                    "Max Mortar Dmg": f"{getattr(s, 'max_mortar_damage', 0.0):.3f}",
+                    "Damaged Mortar": getattr(s, 'damaged_mortar_count', 0)
                 })
             st.dataframe(pd.DataFrame(history_rows), use_container_width=True)
 
@@ -1066,26 +1397,94 @@ def render_cohesive_page():
 # MAIN ROUTING
 # ==============================================================================
 
-if __name__ == "__main__":
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio(
-        "Go to",
-        [
-            "Phase 1: Mix Design",
-            "Phase 2: Geometry Generation",
-            "Phase 3: Conforming Mesh",
-            "Phase 4: Linear FEM",
-            "Phase 5: Cohesive ITZ"
-        ]
-    )
-    
-    if page == "Phase 1: Mix Design":
+PAGE_HOME = "Home"
+PAGE_MIX_DESIGN = "Phase 1: Mix Design"
+PAGE_GEOMETRY = "Phase 2: Geometry Generation"
+PAGE_MESH = "Phase 3: Conforming Mesh"
+PAGE_FEM = "Phase 4: Linear FEM"
+PAGE_COHESIVE = "Phase 5: Cohesive ITZ"
+
+NAV_PAGES = [
+    PAGE_HOME,
+    PAGE_MIX_DESIGN,
+    PAGE_GEOMETRY,
+    PAGE_MESH,
+    PAGE_FEM,
+    PAGE_COHESIVE,
+]
+
+
+def navigate_to_app(target_page: str = PAGE_MIX_DESIGN) -> None:
+    """Callback to switch the active navigation page and trigger a rerun.
+
+    Uses a staging key "_nav_pending" rather than writing directly to the
+    widget-bound "nav_radio" key, which would raise StreamlitAPIException
+    if called after the radio widget has been instantiated in this run.
+    The pending key is consumed at the top of main() on the next run.
+    """
+    st.session_state["_nav_pending"] = target_page
+    st.rerun()
+
+
+def main():
+    # Consume any pending navigation request BEFORE any widget is instantiated.
+    # navigate_to_app() writes to "_nav_pending" to avoid the
+    # StreamlitAPIException that occurs when "nav_radio" (a widget-bound key)
+    # is written after the radio widget has been drawn in the same run.
+    if "_nav_pending" in st.session_state:
+        _pending = st.session_state.pop("_nav_pending")
+        st.session_state["active_page"] = _pending
+        st.session_state["nav_radio"] = _pending
+
+    if "active_page" not in st.session_state:
+        st.session_state["active_page"] = PAGE_HOME
+    if "nav_radio" not in st.session_state:
+        st.session_state["nav_radio"] = st.session_state["active_page"]
+
+    def _sync_nav():
+        st.session_state["active_page"] = st.session_state["nav_radio"]
+
+    active = st.session_state.get("active_page", PAGE_HOME)
+    if active not in NAV_PAGES:
+        active = PAGE_HOME
+        st.session_state["active_page"] = PAGE_HOME
+
+    with st.sidebar:
+        st.markdown("**📊 Mesoscale Concrete FEM**")
+        st.markdown("---")
+        page = st.radio(
+            "Navigation",
+            NAV_PAGES,
+            key="nav_radio",
+            on_change=_sync_nav
+        )
+        st.session_state["active_page"] = page
+
+        if page != PAGE_HOME:
+            st.markdown("---")
+            if st.button("🏠 Return to Landing Page", use_container_width=True, key="sidebar_return_home_btn"):
+                navigate_to_app(PAGE_HOME)
+
+        st.markdown("---")
+        st.caption(
+            "**Mesoscale Concrete FEM**  \n"
+            "B.Tech Civil Engineering Minor Project  \n"
+            "GEC Bilaspur · 7th Semester"
+        )
+
+    if page == PAGE_HOME:
+        render_landing_page(navigate_to_app)
+    elif page == PAGE_MIX_DESIGN:
         render_mix_design_page()
-    elif page == "Phase 2: Geometry Generation":
+    elif page == PAGE_GEOMETRY:
         render_geometry_page()
-    elif page == "Phase 3: Conforming Mesh":
+    elif page == PAGE_MESH:
         render_mesh_page()
-    elif page == "Phase 4: Linear FEM":
+    elif page == PAGE_FEM:
         render_fem_page()
     else:
         render_cohesive_page()
+
+
+if __name__ == "__main__":
+    main()

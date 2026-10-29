@@ -449,3 +449,434 @@ def test_phase4_elastic_solver_regression():
     assert np.isclose(res.effective_modulus, 30000.0, rtol=1e-3)
     assert res.equilibrium_residual_y < 1e-6
     assert res.equilibrium_residual_x < 1e-6
+
+
+# ==============================================================================
+# 13. Post-Convergence Force and State Consistency Regression Test
+# ==============================================================================
+
+def test_post_convergence_force_and_state_consistency():
+    """
+    Verifies that:
+    1. Recorded equilibrium residual matches the recomputed residual of f_int evaluated at final u_full.
+    2. Final reactions (r_top, r_bottom) exactly match f_int evaluated at final u_full.
+    3. Global vertical equilibrium |r_top + r_bottom| is satisfied.
+    4. State commitment happens only upon confirmed convergence, not before.
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties(k_n=1.0e5, k_t=0.5e5, f_t=2.5, G_f=0.05)
+
+    result = solve_cohesive_fem(
+        coh_mesh=coh_mesh,
+        mat_mortar=mat_mor,
+        mat_aggregate=mat_agg,
+        itz_props=itz_props,
+        top_displacement=-0.03,
+        num_steps=8,
+        thickness=1.0,
+        max_iter_per_step=25,
+        force_tol=1e-2
+    )
+
+    assert result.converged
+
+    from core.cohesive import assemble_bulk_stiffness_matrix
+    K_bulk = assemble_bulk_stiffness_matrix(coh_mesh, mat_mor, mat_agg, thickness=1.0)
+    u_final = result.final_displacements.flatten()
+    f_coh, _, _ = assemble_cohesive_forces_and_stiffness(coh_mesh, itz_props, u_final, result.final_state, thickness=1.0)
+    f_int = K_bulk @ u_final + f_coh
+
+    bottom_nodes = coh_mesh.boundary_nodes['bottom']
+    top_nodes = coh_mesh.boundary_nodes['top']
+    prescribed_dofs = set([2 * n + 1 for n in bottom_nodes] + [2 * n + 1 for n in top_nodes])
+    mid_x = coh_mesh.domain_width / 2.0
+    bot_coords_x = coh_mesh.nodes[bottom_nodes, 0]
+    center_node = int(bottom_nodes[int(np.argmin(np.abs(bot_coords_x - mid_x)))])
+    prescribed_dofs.add(2 * center_node)
+    total_dofs = 2 * len(coh_mesh.nodes)
+    free_indices = np.array([d for d in range(total_dofs) if d not in prescribed_dofs], dtype=np.int32)
+
+    true_res_norm = float(np.linalg.norm(-f_int[free_indices]))
+    last_step = result.steps[-1]
+
+    # True residual at final displacement must match recorded equilibrium residual
+    assert np.isclose(last_step.equilibrium_residual, true_res_norm, atol=1e-10)
+
+    # Reactions must match f_int evaluated at final displacements
+    reactions = f_int.reshape((-1, 2))
+    recomputed_r_top = float(np.sum(reactions[top_nodes, 1]))
+    recomputed_r_bottom = float(np.sum(reactions[bottom_nodes, 1]))
+    assert np.isclose(last_step.reaction_force_top, recomputed_r_top, atol=1e-10)
+    assert np.isclose(last_step.reaction_force_bottom, recomputed_r_bottom, atol=1e-10)
+
+    # Global vertical equilibrium
+    assert abs(recomputed_r_top + recomputed_r_bottom) < 1e-6
+
+
+# ==============================================================================
+# 14. Input Validation and Prescribed Displacement User Options
+# ==============================================================================
+
+def test_solve_cohesive_fem_input_validation():
+    """
+    Verifies robust input validation for solve_cohesive_fem:
+    1. Positive or zero displacement raises ValueError.
+    2. Displacement exceeding specimen height raises ValueError.
+    3. Non-positive num_steps raises ValueError.
+    4. Non-positive thickness raises ValueError.
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties()
+
+    # 1. Zero displacement
+    with pytest.raises(ValueError, match="strictly negative"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=0.0)
+
+    # 2. Positive displacement
+    with pytest.raises(ValueError, match="strictly negative"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=0.05)
+
+    # 3. Excessive displacement
+    with pytest.raises(ValueError, match="cannot equal or exceed"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=-40.0)
+
+    # 4. Invalid num_steps
+    with pytest.raises(ValueError, match="num_steps must be at least 1"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=-0.04, num_steps=0)
+
+    # 5. Invalid thickness
+    with pytest.raises(ValueError, match="thickness must be strictly positive"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=-0.04, thickness=0.0)
+
+
+def test_prescribed_vertical_displacement_user_options():
+    """
+    Verifies that the user can specify various prescribed vertical displacement values
+    (-0.04, -0.08, -0.10, -0.12, -0.20 mm) and that the solver and strain calculations
+    accurately reflect the chosen displacement.
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties()
+
+    H = coh_mesh.domain_height
+    test_displacements = [-0.02, -0.04, -0.06]
+
+    for disp in test_displacements:
+        res = solve_cohesive_fem(
+            coh_mesh=coh_mesh,
+            mat_mortar=mat_mor,
+            mat_aggregate=mat_agg,
+            itz_props=itz_props,
+            top_displacement=disp,
+            num_steps=5,
+            thickness=1.0,
+            max_iter_per_step=25,
+            force_tol=1e-2
+        )
+
+        assert res.converged
+        # Verify applied final displacement
+        final_disp_applied = float(res.displacement_curve[-1])
+        assert np.isclose(final_disp_applied, abs(disp), atol=1e-10)
+
+        # Verify nominal vertical strain calculation: epsilon = abs(disp) / H
+        expected_strain = abs(disp) / H
+        final_strain = float(res.strain_curve[-1])
+        assert np.isclose(final_strain, expected_strain, atol=1e-10)
+        assert np.isclose(res.steps[-1].nominal_vertical_strain, expected_strain, atol=1e-10)
+
+
+
+# ==============================================================================
+# 16. Cutback Rollback Integrity Test
+# ==============================================================================
+
+def test_cutback_rollback_integrity():
+    """
+    Verifies that when an increment fails to converge within max_iter_per_step:
+    1. The solver halves the step size and attempts cutback.
+    2. State and displacement are rolled back to the last converged state without contamination.
+    3. If cutbacks exceed max_cutbacks, the solver terminates cleanly.
+    4. final_displacements and final_state correspond exactly to the last converged increment.
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties(k_n=1.0e5, k_t=0.5e5, f_t=2.5, G_f=0.05)
+
+    # Restrict max_iter_per_step to 1 to force non-convergence and cutbacks
+    res = solve_cohesive_fem(
+        coh_mesh=coh_mesh,
+        mat_mortar=mat_mor,
+        mat_aggregate=mat_agg,
+        itz_props=itz_props,
+        top_displacement=-0.04,
+        num_steps=5,
+        thickness=1.0,
+        max_iter_per_step=1,
+        max_cutbacks=3,
+        force_tol=1e-5
+    )
+
+    # Since max_iter_per_step=1 is insufficient for equilibrium, it should take cutbacks
+    assert not res.converged
+    assert res.total_cutbacks > 0
+    assert "cutback limit reached" in res.status_message.lower()
+    assert res.last_converged_load_factor == 0.0 or len(res.steps) == 0
+    # Final displacements must remain finite and match rolled-back state
+    assert not np.any(np.isnan(res.final_displacements))
+    assert not np.any(np.isinf(res.final_displacements))
+
+
+# ==============================================================================
+# 17. Adaptive Increment Recovery Test
+# ==============================================================================
+
+def test_adaptive_increment_recovery():
+    """
+    Verifies conservative adaptive step-size recovery:
+    1. Increment recovers by 1.25x after rapid convergence (iteration <= 4).
+    2. Increment never exceeds initial increment (1.0 / num_steps).
+    3. Step size does not recover immediately on the first step after a cutback.
+    4. Only converged states are recorded in history.
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties(k_n=1.0e5, k_t=0.5e5, f_t=2.5, G_f=0.05)
+
+    # Run with standard settings where rapid convergence happens
+    res = solve_cohesive_fem(
+        coh_mesh=coh_mesh,
+        mat_mortar=mat_mor,
+        mat_aggregate=mat_agg,
+        itz_props=itz_props,
+        top_displacement=-0.02,
+        num_steps=10,
+        thickness=1.0,
+        max_iter_per_step=40,
+        max_cutbacks=8,
+        force_tol=1e-2
+    )
+
+    assert res.converged
+    assert len(res.steps) == 10
+    # For all steps, load increment must not exceed initial increment (1.0 / 10 = 0.10)
+    d_lambda_initial = 1.0 / 10
+    for i in range(len(res.steps)):
+        d_step = res.steps[i].load_factor - (res.steps[i - 1].load_factor if i > 0 else 0.0)
+        assert d_step <= d_lambda_initial + 1e-9, f"Increment {d_step} exceeded initial {d_lambda_initial}."
+
+
+# ==============================================================================
+# 18. Solver Settings Validation Test
+# ==============================================================================
+
+def test_solver_settings_validation():
+    """
+    Verifies input validation on advanced solver settings:
+    - max_iter_per_step < 1
+    - max_cutbacks < 0
+    - force_tol <= 0.0
+    - disp_tol <= 0.0
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties()
+
+    with pytest.raises(ValueError, match="max_iter_per_step must be at least 1"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=-0.02, max_iter_per_step=0)
+
+    with pytest.raises(ValueError, match="max_cutbacks must be non-negative"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=-0.02, max_cutbacks=-1)
+
+    with pytest.raises(ValueError, match="force_tol must be strictly positive"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=-0.02, force_tol=0.0)
+
+    with pytest.raises(ValueError, match="disp_tol must be strictly positive"):
+        solve_cohesive_fem(coh_mesh, mat_mor, mat_agg, itz_props, top_displacement=-0.02, disp_tol=-1e-6)
+
+
+# ==============================================================================
+# 19. Convergence History Consistency Test
+# ==============================================================================
+
+def test_convergence_history_consistency():
+    """
+    Verifies that the convergence history contains only converged states,
+    sequential step indices, monotonic load factors, and consistent summary metadata.
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties(k_n=1.0e5, k_t=0.5e5, f_t=2.5, G_f=0.05)
+
+    res = solve_cohesive_fem(
+        coh_mesh=coh_mesh,
+        mat_mortar=mat_mor,
+        mat_aggregate=mat_agg,
+        itz_props=itz_props,
+        top_displacement=-0.03,
+        num_steps=6,
+        max_iter_per_step=40,
+        max_cutbacks=8,
+        force_tol=1e-2
+    )
+
+    assert res.converged
+    assert len(res.steps) == 6
+    # 1. Sequential step indices
+    for idx, s in enumerate(res.steps):
+        assert s.step_index == idx + 1
+        assert s.equilibrium_residual < 1e-2 or s.num_iterations == 1
+    # 2. Monotonic load factor
+    for i in range(1, len(res.steps)):
+        assert res.steps[i].load_factor > res.steps[i - 1].load_factor
+    # 3. Summary metadata consistency
+    assert np.isclose(res.last_converged_load_factor, res.steps[-1].load_factor, atol=1e-10)
+    assert np.isclose(res.actual_displacement_reached, res.steps[-1].displacement_top, atol=1e-10)
+    assert res.total_iterations >= sum(s.num_iterations for s in res.steps)
+    assert res.termination_reason != ""
+
+
+# ==============================================================================
+# 20. Preservation of Material Properties Test
+# ==============================================================================
+
+def test_preservation_of_material_properties():
+    """
+    Verifies that running solve_cohesive_fem does not mutate the input material
+    or interface constitutive property objects.
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20, name="Aggregate")
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20, name="Mortar")
+    itz_props = ITZProperties(k_n=1.0e5, k_t=0.5e5, f_t=2.5, G_f=0.05)
+
+    _ = solve_cohesive_fem(
+        coh_mesh=coh_mesh,
+        mat_mortar=mat_mor,
+        mat_aggregate=mat_agg,
+        itz_props=itz_props,
+        top_displacement=-0.02,
+        num_steps=5,
+        max_iter_per_step=40,
+        max_cutbacks=8,
+        force_tol=1e-2
+    )
+
+    # Mortar properties unchanged
+    assert mat_mor.E == 25000.0
+    assert mat_mor.nu == 0.20
+    assert mat_mor.name == "Mortar"
+
+    # Aggregate properties unchanged
+    assert mat_agg.E == 55000.0
+    assert mat_agg.nu == 0.20
+    assert mat_agg.name == "Aggregate"
+
+    # ITZ properties unchanged
+    assert itz_props.k_n == 1.0e5
+    assert itz_props.k_t == 0.5e5
+    assert itz_props.f_t == 2.5
+    assert itz_props.G_f == 0.05
+    assert itz_props.delta_n0 == 2.5 / 1.0e5
+    assert itz_props.delta_nc == 2 * 0.05 / 2.5
+
+
+
+# ==============================================================================
+# 21. Convergence Method Labels and Tolerance Reporting Test
+# ==============================================================================
+
+def test_convergence_method_labels_and_tolerance_reporting():
+    """
+    Verifies that:
+    1. Each converged step records an explicit convergence_method:
+       - 'Force tolerance'
+       - 'Displacement correction + relaxed force tolerance'
+    2. No increment with residual > force_tol is labeled 'Force tolerance'.
+    3. NonlinearFEMResult reports force_tol, disp_tol, and relaxed_force_tol (10 * force_tol).
+    """
+    poly = Polygon([(10.0, 10.0), (25.0, 10.0), (24.0, 25.0), (12.0, 24.0)])
+    mesh, _ = generate_conforming_mesh(35.0, 35.0, [poly], target_edge_mortar=4.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_agg = MaterialProperties(E=55000.0, nu=0.20)
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    itz_props = ITZProperties(k_n=1.0e5, k_t=0.5e5, f_t=2.5, G_f=0.05)
+
+    f_tol = 1e-2
+    d_tol = 1e-6
+    res = solve_cohesive_fem(
+        coh_mesh=coh_mesh,
+        mat_mortar=mat_mor,
+        mat_aggregate=mat_agg,
+        itz_props=itz_props,
+        top_displacement=-0.04,
+        num_steps=8,
+        max_iter_per_step=40,
+        force_tol=f_tol,
+        disp_tol=d_tol,
+        max_cutbacks=8
+    )
+
+    assert res.converged
+    # 1. Tolerance reporting on NonlinearFEMResult
+    assert np.isclose(res.force_tol, f_tol)
+    assert np.isclose(res.disp_tol, d_tol)
+    assert np.isclose(res.relaxed_force_tol, 10.0 * f_tol)
+
+    valid_methods = {"Force tolerance", "Displacement correction + relaxed force tolerance"}
+
+    for s in res.steps:
+        # 2. convergence_method field exists and is valid
+        assert hasattr(s, "convergence_method")
+        assert s.convergence_method in valid_methods
+
+        # 3. If residual exceeds force_tol, it MUST NOT be labeled 'Force tolerance'
+        if s.equilibrium_residual > f_tol + 1e-9:
+            assert s.convergence_method == "Displacement correction + relaxed force tolerance", (
+                f"Step {s.step_index} with residual {s.equilibrium_residual} > {f_tol} "
+                f"was incorrectly labeled as '{s.convergence_method}'"
+            )

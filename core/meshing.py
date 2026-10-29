@@ -42,6 +42,28 @@ class ConcreteMesh:
     mesh_params: Dict[str, Any]   # Target sizes, angles, max areas, and limits
     mesher_info: str = "Shewchuk Triangle (via python-triangle)"
     geometry_fingerprint: str = ""
+    mesh_fingerprint: str = ""
+
+
+def compute_mesh_fingerprint(
+    nodes: np.ndarray,
+    triangles: np.ndarray,
+    phase: Optional[np.ndarray] = None,
+    num_cohesive_elements: int = 0
+) -> str:
+    """
+    Computes a deterministic SHA-256 fingerprint for a spatial mesh discretization.
+    Incorporates node count, element count, cohesive element count, node coordinates,
+    triangle connectivity, and phase assignments.
+    """
+    import hashlib
+    hasher = hashlib.sha256()
+    hasher.update(f"NODES:{len(nodes)};TRIS:{len(triangles)};ITZ:{num_cohesive_elements};".encode("utf-8"))
+    hasher.update(np.ascontiguousarray(np.round(nodes, 4)).tobytes())
+    hasher.update(np.ascontiguousarray(triangles).tobytes())
+    if phase is not None:
+        hasher.update(np.ascontiguousarray(phase).tobytes())
+    return hasher.hexdigest()[:16]
 
 
 @dataclass
@@ -265,6 +287,7 @@ def generate_conforming_mesh(
         'right': np.where(np.abs(x - domain_width) <= tol)[0].astype(np.int32)
     }
 
+    mesh_fp = compute_mesh_fingerprint(out_nodes, out_triangles, assigned_phase, 0)
     mesh_params = {
         'target_edge_mortar': target_edge_mortar,
         'target_edge_aggregate': target_edge_aggregate,
@@ -273,7 +296,8 @@ def generate_conforming_mesh(
         'max_area_mortar': max_area_mortar,
         'max_area_aggregate': max_area_aggregate,
         'switches': switches,
-        'geometry_fingerprint': geometry_fingerprint if geometry_fingerprint else compute_geometry_fingerprint(domain_width, domain_height, polygons)
+        'geometry_fingerprint': geometry_fingerprint if geometry_fingerprint else compute_geometry_fingerprint(domain_width, domain_height, polygons),
+        'mesh_fingerprint': mesh_fp
     }
 
     mesh = ConcreteMesh(
@@ -287,7 +311,8 @@ def generate_conforming_mesh(
         domain_height=domain_height,
         mesh_params=mesh_params,
         mesher_info="Shewchuk Triangle (via python-triangle 20250106)",
-        geometry_fingerprint=geometry_fingerprint if geometry_fingerprint else compute_geometry_fingerprint(domain_width, domain_height, polygons)
+        geometry_fingerprint=geometry_fingerprint if geometry_fingerprint else compute_geometry_fingerprint(domain_width, domain_height, polygons),
+        mesh_fingerprint=mesh_fp
     )
     
     return mesh, pre_report
