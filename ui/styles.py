@@ -283,6 +283,18 @@ hr {
 
 
 /* ============================================================
+   PRIMARY BUTTON LABELS
+   Button text is a <p> inside a stMarkdownContainer, so the global dark
+   paragraph colour (and the sidebar "p" rule) was applied to it, giving
+   dark text on the blue button. Force white labels on primary buttons.
+   ============================================================ */
+button[kind="primary"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stBaseButton-primary"] [data-testid="stMarkdownContainer"] p {
+    color: #FFFFFF !important;
+}
+
+
+/* ============================================================
    HERO BANNER
    ============================================================ */
 .hero-box {
@@ -309,7 +321,11 @@ hr {
     margin-bottom: 0.9rem;
 }
 
-.hero-title {
+/* The global "[data-testid=stMarkdownContainer] h1" rule above is more specific
+   than a bare .hero-title, so it was painting the title dark-on-dark. The extra
+   selector below out-ranks it. */
+.hero-title,
+[data-testid="stMarkdownContainer"] .hero-box h1.hero-title {
     font-size: 1.9rem;
     font-weight: 700;
     line-height: 1.25;
