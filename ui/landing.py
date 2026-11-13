@@ -11,6 +11,17 @@ _FIG_DMG_STD = _ASSETS / "damage_standard_mesh.png"
 _FIG_DMG_FINE = _ASSETS / "damage_fine_mesh.png"
 
 
+def _compact(html: str) -> str:
+    """
+    Strip indentation and blank lines from an HTML string.
+
+    Streamlit's st.markdown() runs Markdown first. Any line indented by 4+
+    spaces after a blank line is turned into a code block, which breaks raw
+    HTML. Collapsing the HTML onto a single line avoids that completely.
+    """
+    return " ".join(line.strip() for line in html.splitlines() if line.strip())
+
+
 # Landing-page-only CSS.
 _LANDING_CSS = """
 <style>
@@ -786,7 +797,8 @@ boundaries cause micro-cracks to preferentially nucleate along the ITZ before br
             """
 
         grid_html += "</div>"
-        st.markdown(grid_html, unsafe_allow_html=True)
+        # FIX: compact so Markdown doesn't treat indented HTML as a code block
+        st.markdown(_compact(grid_html), unsafe_allow_html=True)
 
     with st.expander("Scientific model overview"):
         st.caption("Constitutive laws, kinematic assumptions, and numerical formulations:")
@@ -841,11 +853,14 @@ boundaries cause micro-cracks to preferentially nucleate along the ITZ before br
             """
 
         ov_html += "</div>"
-        st.markdown(ov_html, unsafe_allow_html=True)
+        # FIX: compact
+        st.markdown(_compact(ov_html), unsafe_allow_html=True)
 
     with st.expander("Scientific scope, limitations & disclaimer"):
+        # FIX: compact
         st.markdown(
-            """
+            _compact(
+                """
     <div class="disclaimer-box">
         <div class="disclaimer-title">&#9888;&#65039; Scientific Scope &amp; Disclaimer</div>
         <div class="disclaimer-body">
@@ -864,7 +879,8 @@ boundaries cause micro-cracks to preferentially nucleate along the ITZ before br
             </ul>
         </div>
     </div>
-            """,
+                """
+            ),
             unsafe_allow_html=True,
         )
 
@@ -901,10 +917,14 @@ boundaries cause micro-cracks to preferentially nucleate along the ITZ before br
         """
 
     dev_html += "</div>"
-    st.markdown(dev_html, unsafe_allow_html=True)
+    # FIX: this was the bug in the screenshot — only the first card rendered,
+    # the rest became a raw code block.
+    st.markdown(_compact(dev_html), unsafe_allow_html=True)
 
+    # FIX: compact
     st.markdown(
-        """
+        _compact(
+            """
     <div class="institution-block">
         <p>
             <strong>Institution:</strong> Government Engineering College, Bilaspur<br>
@@ -913,7 +933,8 @@ boundaries cause micro-cracks to preferentially nucleate along the ITZ before br
             <strong>Location:</strong> Bilaspur, Chhattisgarh, India
         </p>
     </div>
-        """,
+            """
+        ),
         unsafe_allow_html=True,
     )
 
