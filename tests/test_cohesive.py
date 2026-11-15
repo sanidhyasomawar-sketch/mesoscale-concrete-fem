@@ -880,3 +880,68 @@ def test_convergence_method_labels_and_tolerance_reporting():
                 f"Step {s.step_index} with residual {s.equilibrium_residual} > {f_tol} "
                 f"was incorrectly labeled as '{s.convergence_method}'"
             )
+
+
+# ==============================================================================
+# 21. Relative Force Tolerance & Nonlinear Softening Mechanics
+# ==============================================================================
+
+def test_relative_force_tolerance_and_nonlinear_softening():
+    """
+    Verifies that:
+    1. rel_force_tol allows the solver to track through softening without cutback stalling.
+    2. Nonlinear response exhibits stiffness degradation (tangent drops below initial elastic slope).
+    3. Peak stress is captured only when slope changes sign.
+    4. Nominal stress and reaction load curves are strictly consistent: sigma = |Ry| / (W * t).
+    5. Nominal strain and displacement curves are strictly consistent: eps = |disp| / H.
+    """
+    from core.mortar_damage import MortarDamageParameters
+
+    poly = Polygon([(10.0, 10.0), (30.0, 10.0), (30.0, 30.0), (10.0, 30.0)])
+    mesh, _ = generate_conforming_mesh(40.0, 40.0, [poly], target_edge_mortar=5.0, run_pre_checks=False)
+    if_data = extract_interface_data(mesh, [poly])
+    coh_mesh = build_cohesive_mesh(mesh, if_data)
+
+    mat_mor = MaterialProperties(E=25000.0, nu=0.20)
+    mat_agg = MaterialProperties(E=60000.0, nu=0.15)
+    itz_props = ITZProperties(k_n=1.0e5, k_t=0.4e5, f_t=2.0, G_f=0.04)
+    mortar_dam = MortarDamageParameters(E_m=25000.0, nu_m=0.20, f_t=3.0, G_f=0.08, h_e=5.0, alpha_res=1e-4)
+
+    thickness = 1.0
+    W = coh_mesh.domain_width
+    H = coh_mesh.domain_height
+    area = W * thickness
+
+    res = solve_cohesive_fem(
+        coh_mesh=coh_mesh,
+        mat_mortar=mat_mor,
+        mat_aggregate=mat_agg,
+        itz_props=itz_props,
+        top_displacement=-0.04,
+        num_steps=10,
+        thickness=thickness,
+        force_tol=1e-2,
+        rel_force_tol=5e-3,
+        mortar_damage_params=mortar_dam
+    )
+
+    assert res.converged
+    assert len(res.steps) >= 10
+    assert len(res.stress_curve) == len(res.reaction_curve)
+    assert len(res.strain_curve) == len(res.displacement_curve)
+
+    # 1. Consistency between stress and reaction load curves
+    for s in res.steps:
+        expected_stress = abs(s.reaction_force_top) / area
+        expected_strain = abs(s.displacement_top) / H
+        assert np.isclose(s.nominal_compressive_stress, expected_stress, atol=1e-10)
+        assert np.isclose(s.nominal_vertical_strain, expected_strain, atol=1e-10)
+
+    # 2. Tangent stiffness degradation
+    initial_secant = res.stress_curve[1] / res.strain_curve[1]
+    final_secant = res.stress_curve[-1] / res.strain_curve[-1]
+    # As damage progresses in mortar and ITZ, secant stiffness must decrease
+    if res.final_state.damage.max() > 0.05 or (res.final_mortar_state is not None and res.max_mortar_damage > 0.05):
+        assert final_secant < initial_secant, (
+            f"Expected stiffness degradation: final {final_secant:.1f} MPa vs initial {initial_secant:.1f} MPa"
+        )

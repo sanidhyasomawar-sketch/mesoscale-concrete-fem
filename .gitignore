@@ -35,6 +35,9 @@ Desktop.ini
 # Assistant sidecar metadata files
 *.metadata.json
 
+# Scratch and ad-hoc experiment scripts
+scratch/
+
 # Logs
 *.log
 

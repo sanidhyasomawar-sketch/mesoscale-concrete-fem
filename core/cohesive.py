@@ -765,6 +765,7 @@ class NonlinearFEMResult:
     force_tol: float = 1e-3
     disp_tol: float = 1e-6
     relaxed_force_tol: float = 1e-2
+    rel_force_tol: float = 0.0
     final_mortar_state: Optional[BulkMortarState] = None
     max_mortar_damage: float = 0.0
     damaged_mortar_count: int = 0
@@ -784,7 +785,8 @@ def solve_cohesive_fem(
     force_tol: float = 1e-3,
     disp_tol: float = 1e-6,
     max_cutbacks: int = 8,
-    mortar_damage_params: Optional[MortarDamageParameters] = None
+    mortar_damage_params: Optional[MortarDamageParameters] = None,
+    rel_force_tol: float = 0.0
 ) -> NonlinearFEMResult:
     """
     Executes an incremental displacement-controlled Newton-Raphson solver for the cohesive mesoscale concrete model,
@@ -813,6 +815,8 @@ def solve_cohesive_fem(
         raise ValueError(f"Force tolerance force_tol must be strictly positive, got {force_tol}.")
     if disp_tol <= 0.0:
         raise ValueError(f"Displacement tolerance disp_tol must be strictly positive, got {disp_tol}.")
+    if rel_force_tol < 0.0:
+        raise ValueError(f"Relative force tolerance rel_force_tol must be non-negative, got {rel_force_tol}.")
 
     t_start = time.perf_counter()
 
@@ -934,8 +938,13 @@ def solve_cohesive_fem(
             residual_norm = float(np.linalg.norm(r_free))
             eq_residual_val = residual_norm
 
-            # Convergence test: residual norm check
-            if iteration > 1 and residual_norm < force_tol:
+            # Characteristic reaction force scale for relative equilibrium check
+            f_scale = max(100.0, float(np.abs(np.sum(f_int[top_nodes * 2 + 1]))))
+            rel_res = residual_norm / f_scale
+
+            # Convergence criteria:
+            # 1. Strict force tolerance (absolute or relative):
+            if iteration > 1 and (residual_norm < force_tol or (rel_force_tol > 0.0 and rel_res < rel_force_tol)):
                 converged = True
                 conv_method = "Force tolerance"
                 break
@@ -958,7 +967,11 @@ def solve_cohesive_fem(
             disp_norm = float(np.linalg.norm(du_free))
             disp_norm_val = disp_norm
 
-            if disp_norm < disp_tol and residual_norm < 10.0 * force_tol:
+            # 2. Strict displacement correction + relaxed force bound (< 10 * force_tol or relative)
+            is_disp_conv = (disp_norm < disp_tol) or (rel_force_tol > 0.0 and disp_norm < 5e-5 and rel_res < 5.0 * rel_force_tol)
+            is_force_bounded = (residual_norm < 10.0 * force_tol) or (rel_force_tol > 0.0 and rel_res < rel_force_tol)
+
+            if is_disp_conv and is_force_bounded:
                 converged = True
                 conv_method = "Displacement correction + relaxed force tolerance"
                 break
@@ -1027,15 +1040,10 @@ def solve_cohesive_fem(
             )
             step_results.append(step_res)
 
-            # Conservative adaptive step-size recovery
+            # Adaptive step-size recovery when iterations are stable
             if d_lambda < d_lambda_initial - 1e-12:
-                if steps_since_cutback >= 2 and iteration <= 4:
-                    delta_dam = d_max - prev_max_damage
-                    delta_count = d_count - prev_dmg_count
-                    delta_m_dam = d_mortar_max - prev_max_mortar_damage
-                    delta_m_count = d_mortar_count - prev_mortar_count
-                    if delta_dam < 0.02 and delta_count <= 1 and delta_m_dam < 0.02 and delta_m_count <= 1:
-                        d_lambda = min(d_lambda * 1.25, d_lambda_initial)
+                if steps_since_cutback >= 2 and iteration <= 12:
+                    d_lambda = min(d_lambda * 1.5, d_lambda_initial)
 
             prev_max_damage = d_max
             prev_dmg_count = d_count
@@ -1108,6 +1116,7 @@ def solve_cohesive_fem(
         force_tol=force_tol,
         disp_tol=disp_tol,
         relaxed_force_tol=relaxed_force_tol,
+        rel_force_tol=rel_force_tol,
         final_mortar_state=mortar_state,
         max_mortar_damage=final_mortar_dmg_max,
         damaged_mortar_count=final_mortar_dmg_count,
