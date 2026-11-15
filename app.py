@@ -7,6 +7,8 @@ Phase 2: Aggregate Geometry Generation (IS 383:2016, Stereology & RSP)
 Phase 3: Conforming Triangular Mesh Generation & Interface Topology (Shewchuk's Triangle)
 """
 
+import importlib
+import inspect
 import io
 import os
 import pickle
@@ -18,6 +20,12 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.collections import PatchCollection, LineCollection, PolyCollection
 from shapely.ops import nearest_points
+
+import core.cohesive
+if hasattr(core.cohesive, 'solve_cohesive_fem'):
+    _coh_sig = inspect.signature(core.cohesive.solve_cohesive_fem)
+    if 'rel_force_tol' not in _coh_sig.parameters:
+        core.cohesive = importlib.reload(core.cohesive)
 
 from core.mix_design import MixDesignInputs, calculate_mix_design
 from core.aggregates import (
@@ -1181,21 +1189,27 @@ def render_cohesive_page():
                         alpha_res=1e-6
                     )
 
-                nl_res = solve_cohesive_fem(
-                    coh_mesh=coh_mesh,
-                    mat_mortar=mat_mor,
-                    mat_aggregate=mat_agg,
-                    itz_props=itz_props,
-                    top_displacement=float(disp_top_c),
-                    num_steps=int(n_steps_c),
-                    thickness=float(thickness_c),
-                    platen_friction=platen_fric_bool,
-                    max_iter_per_step=int(max_iter_c),
-                    force_tol=1e-2,
-                    rel_force_tol=5e-3,
-                    max_cutbacks=int(max_cutbacks_c),
-                    mortar_damage_params=mortar_dam_params
-                )
+                solver_kwargs = {
+                    "coh_mesh": coh_mesh,
+                    "mat_mortar": mat_mor,
+                    "mat_aggregate": mat_agg,
+                    "itz_props": itz_props,
+                    "top_displacement": float(disp_top_c),
+                    "num_steps": int(n_steps_c),
+                    "thickness": float(thickness_c),
+                    "platen_friction": platen_fric_bool,
+                    "max_iter_per_step": int(max_iter_c),
+                    "force_tol": 1e-2,
+                    "max_cutbacks": int(max_cutbacks_c),
+                    "mortar_damage_params": mortar_dam_params,
+                }
+
+                # Check solve_cohesive_fem signature dynamically to support long-running Streamlit servers
+                sig = inspect.signature(solve_cohesive_fem)
+                if "rel_force_tol" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                    solver_kwargs["rel_force_tol"] = 5e-3
+
+                nl_res = solve_cohesive_fem(**solver_kwargs)
 
             st.session_state['coh_mesh'] = coh_mesh
             st.session_state['nl_res'] = nl_res

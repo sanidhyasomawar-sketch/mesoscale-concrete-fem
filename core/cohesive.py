@@ -786,12 +786,16 @@ def solve_cohesive_fem(
     disp_tol: float = 1e-6,
     max_cutbacks: int = 8,
     mortar_damage_params: Optional[MortarDamageParameters] = None,
-    rel_force_tol: float = 0.0
+    rel_force_tol: float = 0.0,
+    **kwargs
 ) -> NonlinearFEMResult:
     """
     Executes an incremental displacement-controlled Newton-Raphson solver for the cohesive mesoscale concrete model,
     with optional isotropic tensile damage in bulk mortar elements.
     """
+    if rel_force_tol == 0.0 and "rel_force_tol" in kwargs:
+        rel_force_tol = float(kwargs["rel_force_tol"])
+
     # Input validation
     if top_displacement >= 0.0:
         raise ValueError(
