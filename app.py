@@ -216,7 +216,24 @@ def render_geometry_page():
     - **Packing Algorithm**: Random Sequential Packing (RSP) with spatial boundary confinement and minimum clearance checks.
     """)
 
-    default_fraction = st.session_state.get('vol_ca_fraction_of_concrete', 0.40)
+    # Safely retrieve and clamp transferred Phase 1 aggregate fraction to valid [0.10, 0.65] range
+    MIN_AGG_FRACTION = 0.10
+    MAX_AGG_FRACTION = 0.65
+    FALLBACK_AGG_FRACTION = 0.40
+
+    raw_fraction = st.session_state.get('vol_ca_fraction_of_concrete', FALLBACK_AGG_FRACTION)
+    try:
+        val_fraction = float(raw_fraction)
+        if np.isnan(val_fraction) or np.isinf(val_fraction):
+            val_fraction = FALLBACK_AGG_FRACTION
+        else:
+            val_fraction = float(np.clip(val_fraction, MIN_AGG_FRACTION, MAX_AGG_FRACTION))
+    except (TypeError, ValueError):
+        val_fraction = FALLBACK_AGG_FRACTION
+
+    if 'vol_ca_fraction_of_concrete' in st.session_state:
+        st.session_state['vol_ca_fraction_of_concrete'] = val_fraction
+
     default_size = st.session_state.get('max_size', 20)
 
     with st.sidebar:
@@ -224,7 +241,7 @@ def render_geometry_page():
 
         target_fraction = st.number_input(
             "Target Aggregate Area Fraction",
-            min_value=0.10, max_value=0.65, value=float(default_fraction), step=0.01,
+            min_value=MIN_AGG_FRACTION, max_value=MAX_AGG_FRACTION, value=val_fraction, step=0.01,
             help="Adopted from Phase 1 calculated 3D coarse aggregate volume fraction as a 2D modeling idealization."
         )
 
